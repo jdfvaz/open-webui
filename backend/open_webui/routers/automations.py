@@ -21,6 +21,7 @@ from open_webui.models.config import Config
 from open_webui.models.folders import Folders
 from open_webui.utils.access_control import has_permission
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.automation_integrations import has_only_accessible_ids
 from open_webui.utils.automations import (
     execute_automation,
     next_n_runs_ns,
@@ -103,6 +104,63 @@ async def check_automation_folder_access(folder_id: Optional[str], user, db: Asy
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+
+async def check_automation_tool_access(
+    request: Request,
+    tool_ids: list[str] | None,
+    user,
+    db: AsyncSession,
+):
+    if tool_ids is None:
+        return
+
+    from open_webui.routers.tools import get_tools
+
+    accessible_tool_ids = {tool.id for tool in await get_tools(request, user=user, db=db)}
+    if any(tool_id not in accessible_tool_ids for tool_id in tool_ids):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+
+async def check_automation_skill_access(
+    skill_ids: list[str] | None,
+    user,
+    db: AsyncSession,
+):
+    if skill_ids is None:
+        return
+
+    from open_webui.models.skills import Skills
+
+    accessible_skill_ids = {
+        skill.id for skill in await Skills.get_skills(user_id=user.id, ids=skill_ids, db=db) if skill.is_active
+    }
+    if not has_only_accessible_ids(skill_ids, accessible_skill_ids):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+
+def check_automation_filter_access(request: Request, form_data: AutomationForm):
+    filter_ids = form_data.data.filter_ids
+    if filter_ids is None:
+        return
+
+    models = getattr(request.app.state, 'MODELS', {})
+    model = models.get(form_data.data.model_id, {}) if isinstance(models, dict) else {}
+    model_filters = model.get('filters', []) if isinstance(model, dict) else []
+    accessible_filter_ids = {
+        item.get('id') for item in model_filters if isinstance(item, dict) and isinstance(item.get('id'), str)
+    }
+    if not has_only_accessible_ids(filter_ids, accessible_filter_ids):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
 
@@ -214,6 +272,9 @@ async def create_new_automation(
 ):
     await check_automations_permission(request, user)
     await check_automation_folder_access(form_data.folder_id, user, db)
+    await check_automation_tool_access(request, form_data.data.tool_ids, user, db)
+    await check_automation_skill_access(form_data.data.skill_ids, user, db)
+    check_automation_filter_access(request, form_data)
     await check_automation_channel_access(form_data, user, db)
     try:
         validate_rrule(form_data.data.rrule, tz=user.timezone)
@@ -273,6 +334,9 @@ async def update_automation_by_id(
     automation = await Automations.get_by_id(id, db=db)
     check_automation_access(automation, user)
     await check_automation_folder_access(form_data.folder_id, user, db)
+    await check_automation_tool_access(request, form_data.data.tool_ids, user, db)
+    await check_automation_skill_access(form_data.data.skill_ids, user, db)
+    check_automation_filter_access(request, form_data)
     await check_automation_channel_access(form_data, user, db)
 
     try:

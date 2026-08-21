@@ -39,6 +39,10 @@ from open_webui.models.folders import Folders
 from open_webui.models.messages import MessageForm
 from open_webui.models.users import Users
 from open_webui.utils.auth import create_token
+from open_webui.utils.automation_integrations import (
+    AutomationIntegrationSelection,
+    resolve_automation_integrations,
+)
 from open_webui.utils.misc import parse_duration
 from open_webui.utils.task import prompt_template
 from open_webui.utils.terminals import get_terminal_server_url
@@ -301,37 +305,6 @@ def _build_request(
     return request
 
 
-async def _resolve_model_defaults(app, model_id: str) -> tuple[list[str], dict, list[str], Optional[str]]:
-    models = getattr(app.state, 'MODELS', {})
-    model = models.get(model_id, {})
-    meta = model.get('info', {}).get('meta', {})
-
-    tool_ids = list(meta.get('toolIds') or [])
-    filter_ids = list(meta.get('defaultFilterIds') or [])
-    terminal_id = meta.get('terminalId') or None
-    default_feature_ids = meta.get('defaultFeatureIds', [])
-    if not default_feature_ids:
-        return tool_ids, {}, filter_ids, terminal_id
-
-    capabilities = meta.get('capabilities') or {}
-    features = {}
-
-    # code_interpreter is excluded: it requires the frontend event emitter
-    # and does not work in headless backend execution.
-    feature_checks = {
-        'web_search': await Config.get('web.search.enable'),
-        'image_generation': await Config.get('image_generation.enable'),
-    }
-
-    for feature_id in default_feature_ids:
-        if feature_id in feature_checks:
-            # Feature must be: in defaultFeatureIds + capability enabled + admin enabled
-            if capabilities.get(feature_id) and feature_checks[feature_id]:
-                features[feature_id] = True
-
-    return tool_ids, features, filter_ids, terminal_id
-
-
 async def _set_terminal_cwd(app, server_id: str, user, cwd: str, chat_id: str) -> None:
     """Set the working directory on a terminal server via the proxy.
 
@@ -432,7 +405,16 @@ async def _execute_channel_automation(
             db,
         )
 
-    tool_ids, features, filter_ids, _ = await _resolve_model_defaults(app, model_id)
+    integrations = await resolve_automation_integrations(
+        app,
+        model_id,
+        AutomationIntegrationSelection(
+            tool_ids=automation.data.get('tool_ids'),
+            skill_ids=automation.data.get('skill_ids'),
+            filter_ids=automation.data.get('filter_ids'),
+            feature_ids=automation.data.get('feature_ids'),
+        ),
+    )
 
     form_data = {
         'model': model_id,
@@ -449,13 +431,11 @@ async def _execute_channel_automation(
         'session_id': f'channel:{channel.id}',
         'automation_id': automation.id,
         'background_tasks': {},
+        'tool_ids': integrations.tool_ids,
+        'skill_ids': integrations.skill_ids,
+        'filter_ids': integrations.filter_ids,
+        'features': integrations.features,
     }
-    if tool_ids:
-        form_data['tool_ids'] = tool_ids
-    if features:
-        form_data['features'] = features
-    if filter_ids:
-        form_data['filter_ids'] = filter_ids
 
     await app.state.CHAT_COMPLETION_HANDLER(request, form_data, user=user)
 
@@ -611,8 +591,16 @@ async def execute_automation(app, automation: AutomationModel) -> None:
             room=f'user:{automation.user_id}',
         )
 
-        # Resolve model defaults (frontend does this, backend doesn't)
-        tool_ids, features, filter_ids, terminal_id = await _resolve_model_defaults(app, model_id)
+        integrations = await resolve_automation_integrations(
+            app,
+            model_id,
+            AutomationIntegrationSelection(
+                tool_ids=automation.data.get('tool_ids'),
+                skill_ids=automation.data.get('skill_ids'),
+                filter_ids=automation.data.get('filter_ids'),
+                feature_ids=automation.data.get('feature_ids'),
+            ),
+        )
 
         # Build the same payload the frontend sends to /api/chat/completions
         form_data = {
@@ -631,15 +619,13 @@ async def execute_automation(app, automation: AutomationModel) -> None:
             'session_id': f'automation:{automation.id}',
             'automation_id': automation.id,
             'background_tasks': {},
+            'tool_ids': integrations.tool_ids,
+            'skill_ids': integrations.skill_ids,
+            'filter_ids': integrations.filter_ids,
+            'features': integrations.features,
         }
-        if tool_ids:
-            form_data['tool_ids'] = tool_ids
-        if features:
-            form_data['features'] = features
-        if filter_ids:
-            form_data['filter_ids'] = filter_ids
-        if terminal_id:
-            form_data['terminal_id'] = terminal_id
+        if integrations.terminal_id:
+            form_data['terminal_id'] = integrations.terminal_id
 
         # Call the full chat completion pipeline (same as POST /api/chat/completions).
         # The handler reference is stored on app.state to avoid circular imports.

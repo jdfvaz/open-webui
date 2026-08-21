@@ -31,6 +31,11 @@
 
 	const i18n: typeof i18nType = getContext('i18n');
 	const automationsLayout: any = getContext('automationsLayout');
+	type NamedItem = { readonly id: string; readonly name?: string };
+	const isNamedItem = (value: unknown): value is NamedItem =>
+		value !== null && typeof value === 'object' && 'id' in value && typeof value.id === 'string';
+	const namedItems = (value: unknown): NamedItem[] =>
+		Array.isArray(value) ? value.filter(isNamedItem) : [];
 
 	export let automation: AutomationResponse;
 
@@ -63,18 +68,30 @@
 
 	const getFolderName = (folderId: string | null): string =>
 		folderId
-			? (($folders ?? []).find((folder) => folder.id === folderId)?.name ?? $i18n.t('None'))
+			? (namedItems($folders).find((folder) => folder.id === folderId)?.name ?? $i18n.t('None'))
 			: $i18n.t('None');
 
 	const getDestinationName = (): string => {
 		const target = automation.data.target;
 		if (target?.type === 'channel') {
-			const channel = ($channels ?? []).find((channel) => channel.id === target.channel_id);
+			const channel = namedItems($channels).find((item) => item.id === target.channel_id);
 			return channel?.name ? `#${channel.name}` : $i18n.t('Channel');
 		}
 		return automation.folder_id
 			? `${$i18n.t('Folder')}: ${getFolderName(automation.folder_id)}`
 			: $i18n.t('New chat');
+	};
+	const getIntegrationSelectionLabel = (): string => {
+		const selections = [
+			automation.data.tool_ids,
+			automation.data.skill_ids,
+			automation.data.filter_ids,
+			automation.data.feature_ids
+		];
+		if (selections.every((selection) => selection === null || selection === undefined)) {
+			return $i18n.t('Default');
+		}
+		return String(selections.reduce((count, selection) => count + (selection?.length ?? 0), 0));
 	};
 
 	const formatTime = (ts: number | null): string => {
@@ -317,6 +334,15 @@
 			</span>
 			<span class="min-w-0 truncate text-xs text-gray-700 dark:text-gray-300">
 				{automation.data.model_id}
+			</span>
+		</div>
+
+		<div class="flex h-7 items-center px-3">
+			<span class="w-24 shrink-0 text-[0.6875rem] text-gray-400 dark:text-gray-500">
+				{$i18n.t('Integrations')}
+			</span>
+			<span class="min-w-0 truncate text-xs text-gray-700 dark:text-gray-300">
+				{getIntegrationSelectionLabel()}
 			</span>
 		</div>
 

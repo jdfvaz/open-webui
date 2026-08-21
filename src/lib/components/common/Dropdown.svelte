@@ -19,6 +19,8 @@
 
 	/** CSS classes for the dropdown content container */
 	export let contentClass = '';
+	export let contentRole: 'menu' | 'dialog' = 'menu';
+	export let contentAriaLabel: string | undefined = undefined;
 
 	/** Max height for the dropdown content */
 	export let maxHeight = 'min(32rem, calc(100dvh - 2rem))';
@@ -66,7 +68,14 @@
 
 	/** Svelte action: captures the first child element as the trigger reference */
 	function trigger(node: HTMLElement) {
-		triggerEl = (node.firstElementChild as HTMLElement | null) || node;
+		const firstChild = node.firstElementChild;
+		const triggerElement =
+			node.querySelector<HTMLElement>(
+				'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+			) ?? (firstChild instanceof HTMLElement ? firstChild : node);
+		triggerEl = triggerElement;
+		triggerElement.setAttribute('aria-haspopup', contentRole);
+		triggerElement.setAttribute('aria-expanded', String(show));
 		function handleClick(e: MouseEvent) {
 			e.preventDefault();
 			toggleOpen();
@@ -77,12 +86,12 @@
 				toggleOpen();
 			}
 		}
-		node.addEventListener('click', handleClick);
-		node.addEventListener('keydown', handleKeydown);
+		triggerElement.addEventListener('click', handleClick);
+		triggerElement.addEventListener('keydown', handleKeydown);
 		return {
 			destroy() {
-				node.removeEventListener('click', handleClick);
-				node.removeEventListener('keydown', handleKeydown);
+				triggerElement.removeEventListener('click', handleClick);
+				triggerElement.removeEventListener('keydown', handleKeydown);
 			}
 		};
 	}
@@ -280,6 +289,7 @@
 	$: if (show) {
 		afterOpen();
 	}
+	$: triggerEl?.setAttribute('aria-expanded', String(show));
 
 	function handleWindowPointerDown(event: PointerEvent) {
 		if (!show || !closeOnOutsideClick) return;
@@ -291,6 +301,7 @@
 
 	function handleKeydown(event: KeyboardEvent) {
 		if (event.key === 'Escape' && show) {
+			event.stopImmediatePropagation();
 			closeDropdown();
 		}
 	}
@@ -330,13 +341,7 @@
 	on:resize={positionContent}
 />
 
-<span
-	use:trigger
-	style="display: contents; cursor: pointer;"
-	role="button"
-	aria-haspopup="true"
-	aria-expanded={show}
->
+<span use:trigger style="display: contents; cursor: pointer;">
 	<slot />
 </span>
 
@@ -346,7 +351,8 @@
 		use:portal
 		bind:this={contentEl}
 		class={contentClass}
-		role="menu"
+		role={contentRole}
+		aria-label={contentAriaLabel}
 		tabindex="-1"
 		style:max-height={resolvedMaxHeight}
 		style:overflow-y="auto"

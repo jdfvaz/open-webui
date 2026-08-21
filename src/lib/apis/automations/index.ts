@@ -10,12 +10,18 @@ export type AutomationTarget = {
 	channel_id?: string | null;
 };
 
+export type AutomationFeatureId = 'web_search' | 'image_generation';
+
 export type AutomationData = {
 	prompt: string;
 	model_id: string;
 	rrule: string;
 	terminal?: AutomationTerminalConfig;
 	target?: AutomationTarget | null;
+	tool_ids?: string[] | null;
+	skill_ids?: string[] | null;
+	filter_ids?: string[] | null;
+	feature_ids?: AutomationFeatureId[] | null;
 };
 
 export type AutomationForm = {
@@ -46,7 +52,7 @@ export type AutomationResponse = {
 	folder_id: string | null;
 	name: string;
 	data: AutomationData;
-	meta: Record<string, any> | null;
+	meta: Record<string, unknown> | null;
 	is_active: boolean;
 	last_run_at: number | null;
 	next_run_at: number | null;

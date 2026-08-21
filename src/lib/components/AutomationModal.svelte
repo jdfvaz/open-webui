@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { createEventDispatcher, getContext, tick } from 'svelte';
 	import { toast } from 'svelte-sonner';
+	import type i18nType from '$lib/i18n';
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
@@ -9,6 +10,7 @@
 	import ScheduleDropdown from '$lib/components/automations/ScheduleDropdown.svelte';
 	import ModelDropdown from '$lib/components/automations/ModelDropdown.svelte';
 	import DestinationDropdown from '$lib/components/automations/DestinationDropdown.svelte';
+	import AutomationIntegrations from '$lib/components/automations/AutomationIntegrations.svelte';
 	import { getFolders } from '$lib/apis/folders';
 	import { getChannels } from '$lib/apis/channels';
 	import { channels, folders } from '$lib/stores';
@@ -16,12 +18,25 @@
 	import {
 		createAutomation,
 		updateAutomationById,
+		type AutomationFeatureId,
 		type AutomationForm,
 		type AutomationResponse
 	} from '$lib/apis/automations';
 
-	const i18n = getContext('i18n');
+	const i18n: typeof i18nType = getContext('i18n');
 	const dispatch = createEventDispatcher();
+
+	const includesItemId = (items: unknown, id: string | null | undefined): boolean =>
+		Array.isArray(items) &&
+		items.some(
+			(item) => item !== null && typeof item === 'object' && 'id' in item && item.id === id
+		);
+	const getErrorMessage = (error: unknown): string => {
+		if (error !== null && typeof error === 'object' && 'detail' in error) {
+			return typeof error.detail === 'string' ? error.detail : String(error.detail);
+		}
+		return String(error);
+	};
 
 	export let show = false;
 	export let automation: AutomationResponse | null = null;
@@ -33,6 +48,10 @@
 	let folder_id = '';
 	let target_type: 'chat' | 'channel' = 'chat';
 	let channel_id = '';
+	let tool_ids: string[] | null = null;
+	let skill_ids: string[] | null = null;
+	let filter_ids: string[] | null = null;
+	let feature_ids: AutomationFeatureId[] | null = null;
 	let is_active = true;
 
 	let loading = false;
@@ -67,7 +86,11 @@
 					prompt: prompt.trim(),
 					model_id: model_id.trim(),
 					rrule: scheduleDropdown.buildRrule(),
-					target: target_type === 'channel' ? { type: 'channel', channel_id } : { type: 'chat' }
+					target: target_type === 'channel' ? { type: 'channel', channel_id } : { type: 'chat' },
+					tool_ids,
+					skill_ids,
+					filter_ids,
+					feature_ids
 				},
 				is_active
 			};
@@ -83,8 +106,8 @@
 				show = false;
 				dispatch('save', { id: created?.id });
 			}
-		} catch (e: any) {
-			toast.error(e?.detail ?? `${e}` ?? 'Failed to save');
+		} catch (error: unknown) {
+			toast.error(getErrorMessage(error) || 'Failed to save');
 		} finally {
 			loading = false;
 		}
@@ -110,6 +133,10 @@
 			folder_id = automation.folder_id ?? '';
 			target_type = automation.data.target?.type === 'channel' ? 'channel' : 'chat';
 			channel_id = automation.data.target?.channel_id ?? '';
+			tool_ids = automation.data.tool_ids ?? null;
+			skill_ids = automation.data.skill_ids ?? null;
+			filter_ids = automation.data.filter_ids ?? null;
+			feature_ids = automation.data.feature_ids ?? null;
 			is_active = automation.is_active;
 			if (scheduleDropdown) {
 				scheduleDropdown.parseRrule(automation.data.rrule);
@@ -118,15 +145,15 @@
 			name = cloneFrom.name;
 			prompt = cloneFrom.data.prompt;
 			model_id = cloneFrom.data.model_id;
-			folder_id = ($folders ?? []).some((folder) => folder.id === cloneFrom.folder_id)
-				? (cloneFrom.folder_id ?? '')
-				: '';
+			folder_id = includesItemId($folders, cloneFrom.folder_id) ? (cloneFrom.folder_id ?? '') : '';
 			target_type = cloneFrom.data.target?.type === 'channel' ? 'channel' : 'chat';
-			channel_id = ($channels ?? []).some(
-				(channel) => channel.id === cloneFrom.data.target?.channel_id
-			)
+			channel_id = includesItemId($channels, cloneFrom.data.target?.channel_id)
 				? (cloneFrom.data.target?.channel_id ?? '')
 				: '';
+			tool_ids = cloneFrom.data.tool_ids ?? null;
+			skill_ids = cloneFrom.data.skill_ids ?? null;
+			filter_ids = cloneFrom.data.filter_ids ?? null;
+			feature_ids = cloneFrom.data.feature_ids ?? null;
 			is_active = true;
 			if (scheduleDropdown) {
 				scheduleDropdown.parseRrule(cloneFrom.data.rrule);
@@ -138,6 +165,10 @@
 			folder_id = '';
 			target_type = 'chat';
 			channel_id = '';
+			tool_ids = null;
+			skill_ids = null;
+			filter_ids = null;
+			feature_ids = null;
 			is_active = true;
 		}
 	};
@@ -185,6 +216,14 @@
 				<ScheduleDropdown bind:this={scheduleDropdown} side="top" align="start" />
 
 				<ModelDropdown bind:model_id side="top" align="start" />
+
+				<AutomationIntegrations
+					modelId={model_id}
+					bind:toolIds={tool_ids}
+					bind:skillIds={skill_ids}
+					bind:filterIds={filter_ids}
+					bind:featureIds={feature_ids}
+				/>
 
 				<DestinationDropdown
 					bind:target_type

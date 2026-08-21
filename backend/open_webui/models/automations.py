@@ -76,6 +76,10 @@ class AutomationData(BaseModel):
     rrule: str
     terminal: Optional[AutomationTerminalConfig] = None
     target: Optional[AutomationTarget] = None
+    tool_ids: list[str] | None = None
+    skill_ids: list[str] | None = None
+    filter_ids: list[str] | None = None
+    feature_ids: list[Literal['web_search', 'image_generation']] | None = None
 
 
 class AutomationModel(BaseModel):

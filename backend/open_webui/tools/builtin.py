@@ -3860,6 +3860,10 @@ async def update_automation(
                 model_id=new_model_id,
                 rrule=new_rrule,
                 target=AutomationTarget(**automation.data['target']) if automation.data.get('target') else None,
+                tool_ids=automation.data.get('tool_ids'),
+                skill_ids=automation.data.get('skill_ids'),
+                filter_ids=automation.data.get('filter_ids'),
+                feature_ids=automation.data.get('feature_ids'),
             ),
             is_active=automation.is_active,
         )
