@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
-	import { onMount, tick, getContext } from 'svelte';
+	import { onMount, onDestroy, tick, getContext } from 'svelte';
 	import { openDB, deleteDB } from 'idb';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
@@ -13,7 +13,8 @@
 	import { getTools } from '$lib/apis/tools';
 	import { getBanners } from '$lib/apis/configs';
 	import { getTerminalServers } from '$lib/apis/terminal';
-	import { getUserSettings } from '$lib/apis/users';
+	import { applyAccountTheme } from '$lib/utils/account-theme';
+	import { loadAccountThemeSettings } from '$lib/utils/account-theme-settings';
 	import { setTextScale } from '$lib/utils/text-scale';
 
 	import { WEBUI_VERSION, WEBUI_API_BASE_URL } from '$lib/constants';
@@ -23,6 +24,7 @@
 		config,
 		user,
 		settings,
+		theme,
 		models,
 		knowledge,
 		tools,
@@ -59,6 +61,11 @@
 
 	let version;
 	let handledSettingsUrl = '';
+	let settingsLoadActive = true;
+
+	onDestroy(() => {
+		settingsLoadActive = false;
+	});
 
 	const clearChatInputStorage = () => {
 		const chatInputKeys = Object.keys(localStorage).filter((key) => key.startsWith('chat-input'));
@@ -90,11 +97,22 @@
 	};
 
 	const setUserSettings = async (cb?: () => Promise<void>) => {
-		const userSettings = await getUserSettings(localStorage.token);
+		const accountId = $user?.id;
+		const token = localStorage.token;
+		if (accountId === undefined || !token) return;
+		const isCurrent = () =>
+			settingsLoadActive && $user?.id === accountId && localStorage.token === token;
+		const result = await loadAccountThemeSettings({ accountId, token, isCurrent });
+		if (result === undefined || !isCurrent()) return;
+		const { userSettings, preference } = result;
 
 		if (userSettings?.ui) {
 			settings.set(userSettings.ui);
 		}
+		settings.update((current) => ({ ...current, theme: preference }));
+		theme.set(preference);
+		applyAccountTheme(preference);
+		localStorage.setItem('theme-account', accountId);
 		loadKeybindings(userSettings?.keybindings);
 
 		setTextScale($settings?.textScale ?? 1);

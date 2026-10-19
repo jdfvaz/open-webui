@@ -316,12 +316,15 @@ export const updateUserSettings = async (token: string, settings: object) => {
 		})
 		.catch((err) => {
 			console.error(err);
-			error = err.detail;
+			error = err?.detail ?? err;
 			return null;
 		});
 
 	if (error) {
 		throw error;
+	}
+	if (res === null || typeof res !== 'object' || Array.isArray(res)) {
+		throw new TypeError('OpenWebUI returned invalid saved user settings.');
 	}
 
 	return res;

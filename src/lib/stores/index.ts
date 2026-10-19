@@ -214,6 +214,7 @@ type OllamaModelDetails = {
 };
 
 type Settings = {
+	theme?: import('$lib/utils/account-theme').AccountTheme;
 	pinnedModels?: string[];
 	toolServers?: never[];
 	detectArtifacts?: boolean;
