@@ -2,12 +2,14 @@ import asyncio
 import http.cookiejar
 import ipaddress
 import logging
+import math
 import socket
 import ssl
 import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from importlib import import_module
 from typing import (
     Any,
     AsyncIterator,
@@ -23,34 +25,21 @@ from typing import (
 )
 
 import aiohttp
-import aiohttp.resolver
 import certifi
 import requests
 import urllib3.connection
 import urllib3.connectionpool
 import validators
 from requests.adapters import HTTPAdapter
+from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
-from langchain_community.document_loaders import PlaywrightURLLoader, WebBaseLoader
-from langchain_community.document_loaders.base import BaseLoader
+from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 from open_webui.config import (
+    DEFAULT_CONFIG,
     ENABLE_LOCAL_WEB_FETCH,
-    EXTERNAL_WEB_LOADER_API_KEY,
-    EXTERNAL_WEB_LOADER_URL,
-    FIRECRAWL_API_BASE_URL,
-    FIRECRAWL_API_KEY,
-    FIRECRAWL_TIMEOUT,
     MICROSOFT_WEB_IQ_API_BASE_URL,
-    MICROSOFT_WEB_IQ_API_KEY,
-    MICROSOFT_WEB_IQ_LANGUAGE,
-    PLAYWRIGHT_TIMEOUT,
-    PLAYWRIGHT_WS_URL,
-    TAVILY_API_KEY,
-    TAVILY_EXTRACT_DEPTH,
     WEB_FETCH_FILTER_LIST,
-    WEB_LOADER_ENGINE,
-    WEB_LOADER_TIMEOUT,
 )
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import (
@@ -59,12 +48,13 @@ from open_webui.env import (
     AIOHTTP_CLIENT_SSL_CERT_FILE,
     AIOHTTP_CLIENT_TIMEOUT,
     USER_AGENT,
+    USE_SLIM,
 )
 from open_webui.retrieval.loaders.external_web import ExternalWebLoader
 from open_webui.retrieval.loaders.microsoft_web_iq import MicrosoftWebIQLoader
 from open_webui.retrieval.loaders.tavily import TavilyLoader
 from open_webui.retrieval.web.firecrawl import scrape_firecrawl_url
-from open_webui.utils.misc import is_host_allowed
+from open_webui.utils.misc import is_host_allowed, is_host_blocked
 
 log = logging.getLogger(__name__)
 
@@ -80,12 +70,10 @@ def resolve_hostname(hostname):
     return ipv4_addresses, ipv6_addresses
 
 
-def _is_global_addr(ip: str) -> bool:
-    addr = ipaddress.ip_address(ip)
-    if not addr.is_global:
-        return False
+def _embedded_ipv4(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
+    """The IPv4 addresses an IPv6 address carries: mapped, compatible, 6to4, teredo and NAT64."""
     if not isinstance(addr, ipaddress.IPv6Address):
-        return True
+        return []
 
     embedded = []
     if addr.ipv4_mapped:
@@ -96,21 +84,54 @@ def _is_global_addr(ip: str) -> bool:
         embedded.extend(addr.teredo)
 
     b = addr.packed
-    if b[:12] == b'\x00' * 12:
-        embedded.append(ipaddress.IPv4Address(b[12:]))
-    elif b[:12] == b'\x00\x64\xff\x9b' + b'\x00' * 8:
+    # Prefixes that put the address in the last four bytes: v4-compatible and NAT64 /96.
+    if b[:12] in (b'\x00' * 12, b'\x00\x64\xff\x9b' + b'\x00' * 8):
         embedded.append(ipaddress.IPv4Address(b[12:]))
     elif b[:6] == b'\x00\x64\xff\x9b\x00\x01':
-        if b[8] != 0:
-            return False
         embedded.append(ipaddress.IPv4Address(bytes((b[6], b[7], b[9], b[10]))))
 
-    return all(ip.is_global for ip in embedded)
+    return embedded
+
+
+def _assert_host_allowed(host: str | None) -> None:
+    if WEB_FETCH_FILTER_LIST and not is_host_allowed(host, WEB_FETCH_FILTER_LIST):
+        log.warning(f'Blocked by filter list: {host}')
+        raise ValueError(ERROR_MESSAGES.INVALID_URL)
+
+
+def _assert_addresses_allowed(addresses: Sequence[str]) -> None:
+    # An IPv6 address can carry a blocked IPv4 address inside it, so judge both spellings.
+    parsed = [ipaddress.ip_address(address) for address in addresses]
+    candidates = [*parsed, *(ipv4 for address in parsed for ipv4 in _embedded_ipv4(address))]
+
+    # Block entries only: an allow entry names a host, so judging a resolved address against one
+    # would reject every allow-listed host.
+    if is_host_blocked([str(address) for address in candidates], WEB_FETCH_FILTER_LIST):
+        log.warning(f'Blocked by filter list: {", ".join(str(address) for address in candidates)}')
+        raise ValueError(ERROR_MESSAGES.INVALID_URL)
+
+    if not ENABLE_LOCAL_WEB_FETCH:
+        for address in candidates:
+            if not address.is_global:
+                log.warning(f'Blocked non-global address: {address}')
+                raise ValueError(ERROR_MESSAGES.INVALID_URL)
+
+
+def is_identity_encoding(content_encodings: Sequence[str]) -> bool:
+    """True when no content coding was applied, so the body costs what the sender transmitted."""
+    return all(content_encoding.lower() in ('', 'identity') for content_encoding in content_encodings)
+
+
+def assert_identity_encoding(content_encodings: Sequence[str]) -> None:
+    """Reject a compressed body, whose decoded size the sender would choose for us."""
+    if not is_identity_encoding(content_encodings):
+        log.warning('Blocked compressed response body: %s', ', '.join(content_encodings))
+        raise ValueError(ERROR_MESSAGES.COMPRESSED_RESPONSE)
 
 
 def validate_url(url: Union[str, Sequence[str]]):
     if isinstance(url, str):
-        if isinstance(validators.url(url), validators.ValidationError):
+        if isinstance(validators.url(url, simple_host=ENABLE_LOCAL_WEB_FETCH), validators.ValidationError):
             raise ValueError(ERROR_MESSAGES.INVALID_URL)
 
         # Reject parser-confusing chars: urlparse and requests/aiohttp split
@@ -128,24 +149,22 @@ def validate_url(url: Union[str, Sequence[str]]):
             log.warning(f'Blocked non-HTTP(S) protocol: {parsed_url.scheme} in URL: {url}')
             raise ValueError(ERROR_MESSAGES.INVALID_URL)
 
-        # Blocklist check using unified filtering logic
-        if WEB_FETCH_FILTER_LIST:
-            # Match on the parsed hostname, not the full URL: a path component would
-            # otherwise let any URL slip past a hostname-based block/allow entry.
-            if not is_host_allowed(parsed_url.hostname, WEB_FETCH_FILTER_LIST):
-                log.warning(f'URL blocked by filter list: {url}')
-                raise ValueError(ERROR_MESSAGES.INVALID_URL)
+        # Match on the parsed hostname, not the full URL: a path component would
+        # otherwise let any URL slip past a hostname-based block/allow entry.
+        _assert_host_allowed(parsed_url.hostname)
 
-        if not ENABLE_LOCAL_WEB_FETCH:
-            # Local web fetch is disabled, filter out URLs that resolve to non-global IP addresses.
-            parsed_url = urllib.parse.urlparse(url)
-            # Get IPv4 and IPv6 addresses
+        try:
             ipv4_addresses, ipv6_addresses = resolve_hostname(parsed_url.hostname)
-            # Check if any of the resolved addresses are private
-            # DNS rebinding is mitigated at the connection layer; see _SSRFSafeResolver / _SSRFSafeAdapter
-            for ip in ipv4_addresses + ipv6_addresses:
-                if not _is_global_addr(ip):
-                    raise ValueError(ERROR_MESSAGES.INVALID_URL)
+        except (socket.gaierror, UnicodeError) as e:
+            # With local fetch on, a proxied deployment can carry names only the proxy resolves.
+            if not ENABLE_LOCAL_WEB_FETCH:
+                log.warning(f'Could not resolve host {parsed_url.hostname}: {e}')
+                raise ValueError(ERROR_MESSAGES.INVALID_URL) from None
+            ipv4_addresses, ipv6_addresses = [], []
+
+        # A hostname match alone lets a DNS record point at a blocked address.
+        # DNS rebinding is mitigated at the connection layer; see _SSRFSafeConnector / _SSRFSafeAdapter
+        _assert_addresses_allowed(ipv4_addresses + ipv6_addresses)
         return True
     elif isinstance(url, Sequence):
         return all(validate_url(u) for u in url)
@@ -166,7 +185,7 @@ def safe_validate_urls(url: Sequence[str]) -> Sequence[str]:
 
 
 def _ssrf_safe_new_conn(self):
-    """Resolve DNS, validate all IPs are global, connect to validated IP.
+    """Resolve DNS, screen every resolved address, connect to one of them.
 
     Replaces urllib3's _new_conn so the DNS lookup that feeds the actual TCP
     connect is the same one we validate — no second resolution, no rebinding
@@ -177,10 +196,7 @@ def _ssrf_safe_new_conn(self):
     infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
     if not infos:
         raise OSError(f'getaddrinfo for {host!r} returned empty list')
-    if not ENABLE_LOCAL_WEB_FETCH:
-        for _, _, _, _, sa in infos:
-            if not _is_global_addr(sa[0]):
-                raise ValueError(ERROR_MESSAGES.INVALID_URL)
+    _assert_addresses_allowed([sa[0] for _, _, _, _, sa in infos])
     err = None
     for fam, typ, proto, _, sa in infos:
         sock = None
@@ -223,7 +239,7 @@ class _SafeHTTPSPool(urllib3.connectionpool.HTTPSConnectionPool):
 
 
 class _SSRFSafeAdapter(HTTPAdapter):
-    """requests transport adapter that validates resolved IPs at connect time."""
+    """requests adapter that rejects filter-listed request targets and non-global IPs at connect time."""
 
     def init_poolmanager(self, *args, **kwargs):
         super().init_poolmanager(*args, **kwargs)
@@ -232,21 +248,31 @@ class _SSRFSafeAdapter(HTTPAdapter):
             'https': _SafeHTTPSPool,
         }
 
+    def send(self, request, *args, **kwargs):
+        # Per request, not per connection: the connection layer sees the proxy.
+        _assert_host_allowed(urllib.parse.urlparse(request.url).hostname)
+        response = super().send(request, *args, **kwargs)
+        assert_identity_encoding(response.raw.headers.getlist('Content-Encoding'))
+        return response
 
-class _SSRFSafeResolver(aiohttp.resolver.DefaultResolver):
-    """aiohttp resolver that rejects non-global IPs unless local fetch is on."""
 
-    async def resolve(self, host, port=0, family=socket.AF_INET):
-        results = await super().resolve(host, port, family)
-        if not ENABLE_LOCAL_WEB_FETCH:
-            for entry in results:
-                if not _is_global_addr(entry['host']):
-                    raise ValueError(ERROR_MESSAGES.INVALID_URL)
+class _SSRFSafeConnector(aiohttp.TCPConnector):
+    """Rejects filter-listed request targets, and non-global IPs on each new connection."""
+
+    async def connect(self, req, traces, timeout):
+        # Per request, not per connection: _resolve_host sees the proxy and pooled reuse skips it.
+        _assert_host_allowed(req.url.host)
+        return await super().connect(req, traces, timeout)
+
+    async def _resolve_host(self, host, port, traces=None):
+        # aiohttp answers IP-literal hosts itself without consulting a resolver.
+        results = await super()._resolve_host(host, port, traces=traces)
+        _assert_addresses_allowed([entry['host'] for entry in results])
         return results
 
 
 def get_ssrf_safe_session(trust_env: bool = True, store_cookies: bool = True) -> aiohttp.ClientSession:
-    """A one-off aiohttp session that re-validates the connect-time IP via _SSRFSafeResolver,
+    """A one-off aiohttp session that re-validates every connection via _SSRFSafeConnector,
     defeating DNS rebinding. Use for validate_url-gated fetches of user-supplied URLs that must
     not use the shared (rebinding-vulnerable) pool. Use as a context manager so it is closed:
     ``async with get_ssrf_safe_session() as session: ...``.
@@ -255,7 +281,7 @@ def get_ssrf_safe_session(trust_env: bool = True, store_cookies: bool = True) ->
     IP check, because the proxy resolves the hostname instead.
     """
     return aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(resolver=_SSRFSafeResolver()),
+        connector=_SSRFSafeConnector(),
         timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
         trust_env=trust_env,
         cookie_jar=None if store_cookies else aiohttp.DummyCookieJar(),
@@ -281,9 +307,19 @@ _DROPPED_REQUEST_HEADERS = {'accept-encoding', 'connection', 'content-length', '
 # The clients hand us a decoded body, so the sender's framing no longer describes it.
 _DROPPED_RESPONSE_HEADERS = {'connection', 'content-encoding', 'content-length', 'transfer-encoding'}
 
+# The Playwright loader only reads the page HTML, which none of these feed.
+_DROPPED_RESOURCE_TYPES = {'font', 'image', 'media'}
+
+# unstructured keeps only the first <main>, so text in any others would be dropped.
+_UNWRAP_EXTRA_MAINS = (
+    '() => { const mains = document.querySelectorAll("main"); '
+    'if (mains.length > 1) mains.forEach(main => main.replaceWith(...main.childNodes)); }'
+)
+
 
 def _forwardable_request_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    return {name: value for name, value in headers.items() if name.lower() not in _DROPPED_REQUEST_HEADERS}
+    forwardable = {name: value for name, value in headers.items() if name.lower() not in _DROPPED_REQUEST_HEADERS}
+    return forwardable | {'Accept-Encoding': 'identity'}
 
 
 def _fulfillable_response_headers(header_pairs: Iterable[Tuple[str, str]]) -> Dict[str, str]:
@@ -347,6 +383,111 @@ class RateLimitMixin:
             if time_since_last < min_interval:
                 time.sleep((min_interval - time_since_last).total_seconds())
         self.last_request_time = datetime.now()
+
+
+class SafeExaLoader(BaseLoader, RateLimitMixin):
+    def __init__(
+        self,
+        web_paths: Union[str, Sequence[str]],
+        api_key: str,
+        timeout: Optional[str] = None,
+        verify_ssl: bool = True,
+        trust_env: bool = False,
+        requests_per_second: Optional[float] = None,
+        continue_on_failure: bool = True,
+    ):
+        if not api_key or not api_key.strip():
+            raise ValueError('Exa web loader requires an EXA_API_KEY')
+        self.web_paths = [web_paths] if isinstance(web_paths, str) else list(web_paths)
+        self.api_key = api_key
+        try:
+            request_timeout = float(timeout)
+        except (TypeError, ValueError):
+            request_timeout = 60
+        self.timeout = request_timeout if math.isfinite(request_timeout) and request_timeout > 0 else 60
+        self.verify_ssl = verify_ssl
+        self.trust_env = trust_env
+        self.requests_per_second = requests_per_second
+        self.last_request_time = None
+        self.continue_on_failure = continue_on_failure
+
+    def lazy_load(self) -> Iterator[Document]:
+        # Exa's search models import this module for URL validation.
+        from open_webui.retrieval.web.exa import EXA_API_BASE
+
+        loaded = 0
+        with requests.Session() as session:
+            session.trust_env = self.trust_env
+            session.verify = self.verify_ssl
+            session.headers.update({'Authorization': f'Bearer {self.api_key}'})
+            for offset in range(0, len(self.web_paths), 100):
+                urls = self.web_paths[offset : offset + 100]
+                self._sync_wait_for_rate_limit()
+                try:
+                    response = session.post(
+                        f'{EXA_API_BASE}/contents',
+                        json={'urls': urls, 'text': True},
+                        timeout=self.timeout,
+                        allow_redirects=False,
+                    )
+                    if response.status_code in (401, 402, 403):
+                        raise PermissionError(
+                            f'Exa web loader authentication or billing failed (HTTP {response.status_code})'
+                        )
+                    response.raise_for_status()
+                    data = response.json()
+                    if not isinstance(data, dict) or not isinstance(data.get('results'), list):
+                        raise ValueError('Invalid Exa Contents response')
+                    if data.get('statuses') is not None and not isinstance(data['statuses'], list):
+                        raise ValueError('Invalid Exa Contents statuses')
+                except PermissionError:
+                    raise
+                except (requests.RequestException, ValueError) as e:
+                    # Do not log provider bodies or exception messages, which can contain credentials.
+                    log.warning('Exa web loader batch failed (%s)', type(e).__name__)
+                    if not self.continue_on_failure:
+                        raise ValueError('Exa web loader request failed') from None
+                    continue
+
+                failed_ids = {
+                    status.get('id')
+                    for status in (data.get('statuses') or [])
+                    if isinstance(status, dict)
+                    and isinstance(status.get('id'), str)
+                    and status.get('status') != 'success'
+                }
+                documents = {}
+                for result in data['results']:
+                    if not isinstance(result, dict):
+                        continue
+                    source = next((result.get(key) for key in ('id', 'url') if result.get(key) in urls), None)
+                    content = result.get('text')
+                    if source is None or source in failed_ids or not isinstance(content, str):
+                        continue
+                    if not content.strip():
+                        continue
+                    metadata = {'source': source}
+                    if isinstance(result.get('title'), str):
+                        metadata['title'] = result['title']
+                    documents[source] = Document(page_content=content, metadata=metadata)
+
+                missing = len(set(urls) - documents.keys())
+                if missing:
+                    log.warning('Exa web loader could not load %s URL(s)', missing)
+                    if not self.continue_on_failure:
+                        raise ValueError(f'Exa web loader could not load {missing} URL(s)')
+                for url in urls:
+                    if url in documents:
+                        loaded += 1
+                        yield documents[url]
+
+        if not loaded:
+            raise ValueError('Exa web loader could not load any page content')
+
+    async def alazy_load(self) -> AsyncIterator[Document]:
+        docs = await run_in_threadpool(lambda: list(self.lazy_load()))
+        for doc in docs:
+            yield doc
 
 
 class URLProcessingMixin:
@@ -564,6 +705,7 @@ class SafeMicrosoftWebIQLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
         self,
         web_paths: Union[str, List[str]],
         api_key: str,
+        api_base_url: str = MICROSOFT_WEB_IQ_API_BASE_URL,
         language: str = 'en',
         verify_ssl: bool = True,
         trust_env: bool = False,
@@ -573,6 +715,7 @@ class SafeMicrosoftWebIQLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
     ):
         self.web_paths = web_paths if isinstance(web_paths, list) else [web_paths]
         self.api_key = api_key
+        self.api_base_url = api_base_url
         self.language = language
         self.verify_ssl = verify_ssl
         self.trust_env = trust_env
@@ -620,7 +763,7 @@ class SafeMicrosoftWebIQLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
                 raise e
 
 
-class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessingMixin):
+class SafePlaywrightURLLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
     """Load HTML pages safely with Playwright, supporting SSL verification, rate limiting, and remote browser connection.
 
     Attributes:
@@ -651,6 +794,13 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         playwright_timeout: Optional[int] = 10000,
     ):
         """Initialize with additional safety parameters and remote browser support."""
+        if USE_SLIM:
+            raise HTTPException(
+                503, 'Playwright is unavailable in slim. Use basic HTTP fetching or an external web loader.'
+            )
+
+        for package in ('playwright', 'unstructured'):
+            import_module(package)
 
         proxy_server = proxy.get('server') if proxy else None
         if trust_env and not proxy_server:
@@ -662,20 +812,23 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                 else:
                     proxy = {'server': env_proxy_server}
 
-        # We'll set headless to False if using playwright_ws_url since it's handled by the remote browser
-        super().__init__(
-            urls=web_paths,
-            continue_on_failure=continue_on_failure,
-            headless=headless if playwright_ws_url is None else False,
-            remove_selectors=remove_selectors,
-            proxy=proxy,
-        )
+        self.urls = web_paths
+        self.continue_on_failure = continue_on_failure
+        self.headless = headless if playwright_ws_url is None else False
+        self.remove_selectors = remove_selectors or []
+        self.proxy = proxy
         self.verify_ssl = verify_ssl
         self.requests_per_second = requests_per_second
         self.last_request_time = None
         self.playwright_ws_url = playwright_ws_url
         self.trust_env = trust_env
         self.playwright_timeout = playwright_timeout
+
+    @staticmethod
+    def _extract_html(html):
+        from unstructured.partition.html import partition_html
+
+        return '\n\n'.join(str(element) for element in partition_html(text=html))
 
     def _request_timeout(self) -> float:
         # per-hop budget, since page.goto's timeout cannot reach into our own fetch and 0 disables
@@ -696,6 +849,9 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
 
     def _intercept_navigation_sync(self, route, session):
         req = route.request
+        if req.resource_type in _DROPPED_RESOURCE_TYPES:
+            route.abort()
+            return
 
         hop_cookies: List[Tuple[str, str]] = []
 
@@ -750,6 +906,9 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
 
     async def _intercept_navigation(self, route, session):
         req = route.request
+        if req.resource_type in _DROPPED_RESOURCE_TYPES:
+            await route.abort()
+            return
 
         hop_cookies: List[Tuple[str, str]] = []
 
@@ -769,6 +928,7 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                     ssl=AIOHTTP_CLIENT_SESSION_SSL if self.verify_ssl else False,
                     timeout=aiohttp.ClientTimeout(total=self._request_timeout()),
                 )
+                assert_identity_encoding(response.headers.getall('Content-Encoding', ()))
                 # aiohttp only returns the connection to the pool once the body is buffered
                 return response, await response.read()
 
@@ -824,12 +984,19 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                             browser.new_page(service_workers='block') as page,
                         ):
                             page.route('**/*', lambda route: self._intercept_navigation_sync(route, session))
-                            page.route_web_socket('**/*', lambda ws_route: ws_route.close())
+                            # sync close() hangs the dispatcher; a no-op handler still never connects to the server
+                            page.route_web_socket('**/*', lambda ws_route: None)
                             response = page.goto(url, timeout=self.playwright_timeout)
                             if response is None:
                                 raise ValueError(f'page.goto() returned None for url {url}')
 
-                            text = self.evaluator.evaluate(page, browser, response)
+                            for selector in self.remove_selectors:
+                                for element in page.locator(selector).all():
+                                    if element.is_visible():
+                                        element.evaluate('element => element.remove()')
+                            page.evaluate(_UNWRAP_EXTRA_MAINS)
+                            text = self._extract_html(page.content())
+                            page.unroute_all(behavior='ignoreErrors')
                             metadata = {'source': url}
                             yield Document(page_content=text, metadata=metadata)
                     except Exception as e:
@@ -864,7 +1031,13 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                             if response is None:
                                 raise ValueError(f'page.goto() returned None for url {url}')
 
-                            text = await self.evaluator.evaluate_async(page, browser, response)
+                            for selector in self.remove_selectors:
+                                for element in await page.locator(selector).all():
+                                    if await element.is_visible():
+                                        await element.evaluate('element => element.remove()')
+                            await page.evaluate(_UNWRAP_EXTRA_MAINS)
+                            text = await asyncio.to_thread(self._extract_html, await page.content())
+                            await page.unroute_all(behavior='ignoreErrors')
                             metadata = {'source': url}
                             yield Document(page_content=text, metadata=metadata)
                     except Exception as e:
@@ -874,45 +1047,65 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                         raise e
 
 
-class SafeWebBaseLoader(WebBaseLoader):
-    """WebBaseLoader with enhanced error handling for URLs."""
+WEB_LOADER_HEADERS = {
+    'User-Agent': USER_AGENT or 'DefaultLangchainUserAgent',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Encoding': 'identity',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://www.google.com/',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+}
 
-    def __init__(self, trust_env: bool = False, *args, **kwargs):
-        """Initialize SafeWebBaseLoader
-        Args:
-            trust_env (bool, optional): set to True if using proxy to make web requests, for example
-                using http(s)_proxy environment variables. Defaults to False.
-        """
-        # lxml parses scraped pages far faster than the html.parser default
-        kwargs.setdefault('default_parser', 'lxml')
-        super().__init__(*args, **kwargs)
+
+class SafeWebBaseLoader(BaseLoader):
+    """Fetch pages with connect-time address checks and bounded concurrency."""
+
+    def __init__(
+        self,
+        web_paths,
+        verify_ssl=True,
+        trust_env=False,
+        requests_per_second=2,
+        continue_on_failure=False,
+        requests_kwargs=None,
+        raise_for_status=False,
+        default_parser='lxml',
+        bs_kwargs=None,
+        bs_get_text_kwargs=None,
+    ):
+        self.web_paths = list(web_paths)
         self.trust_env = trust_env
+        self.requests_per_second = requests_per_second
+        self.continue_on_failure = continue_on_failure
+        self.requests_kwargs = {**(requests_kwargs or {}), 'allow_redirects': AIOHTTP_CLIENT_ALLOW_REDIRECTS}
+        self.raise_for_status = raise_for_status
+        self.default_parser = default_parser
+        self.bs_kwargs = bs_kwargs or {}
+        self.bs_get_text_kwargs = bs_get_text_kwargs or {}
+        # Preserve the synchronous loader's environment-proxy behavior.
+        self.session = get_ssrf_safe_requests_session()
+        self.session.verify = verify_ssl
+        self.session.headers = WEB_LOADER_HEADERS
 
-        # Propagate USER_AGENT env var so that both the sync _scrape() and
-        # async _fetch() paths present a real UA instead of python-requests/2.x
-        # which gets blocked by Cloudflare, Wikipedia, and similar bot-detection.
-        # _fetch() forwards self.session.headers to the aiohttp session, so
-        # setting it here covers both code-paths.
-        if USER_AGENT:
-            self.session.headers['User-Agent'] = USER_AGENT
+    async def fetch_all(self, urls):
+        semaphore = asyncio.Semaphore(self.requests_per_second)
 
-        # Prevent redirect-based SSRF on the synchronous _scrape() path.
-        # validate_url() is called once on the originally-submitted URL, but the
-        # parent WebBaseLoader's _scrape() invokes self.session.get(url, **self.requests_kwargs)
-        # which by default follows redirects. Without the override below, an attacker
-        # can submit a public URL that 302-redirects to an internal address (RFC1918,
-        # 127.0.0.1, 169.254.169.254, etc.) and the redirected target is fetched without
-        # re-validation. Matches the policy enforced on the async _fetch() path below.
-        self.requests_kwargs = {
-            **(self.requests_kwargs or {}),
-            'allow_redirects': AIOHTTP_CLIENT_ALLOW_REDIRECTS,
-        }
+        async def fetch(url):
+            async with semaphore:
+                try:
+                    return await self._fetch(url)
+                except Exception as e:
+                    if not self.continue_on_failure:
+                        raise
+                    log.warning('Error fetching %s: %s', url, e)
+                    return ''
 
-        self.session.mount('http://', _SSRFSafeAdapter())
-        self.session.mount('https://', _SSRFSafeAdapter())
+        return await asyncio.gather(*(fetch(url) for url in urls))
 
     async def _fetch(self, url: str, retries: int = 3, cooldown: int = 2, backoff: float = 1.5) -> str:
-        connector = aiohttp.TCPConnector(resolver=_SSRFSafeResolver())
+        connector = _SSRFSafeConnector()
         async with aiohttp.ClientSession(trust_env=self.trust_env, connector=connector) as session:
             for i in range(retries):
                 try:
@@ -925,12 +1118,13 @@ class SafeWebBaseLoader(WebBaseLoader):
                     else:
                         kwargs['ssl'] = AIOHTTP_CLIENT_SESSION_SSL
 
-                    async with session.get(
-                        url,
-                        **(self.requests_kwargs | kwargs),
-                    ) as response:
+                    options = self.requests_kwargs | kwargs
+                    if isinstance(options.get('timeout'), (int, float)):
+                        options['timeout'] = aiohttp.ClientTimeout(total=options['timeout'])
+                    async with session.get(url, **options) as response:
                         if self.raise_for_status:
                             response.raise_for_status()
+                        assert_identity_encoding(response.headers.getall('Content-Encoding', ()))
                         return await response.text()
                 except aiohttp.ClientConnectionError as e:
                     if i == retries - 1:
@@ -940,38 +1134,24 @@ class SafeWebBaseLoader(WebBaseLoader):
                         await asyncio.sleep(cooldown * backoff**i)
         raise ValueError('retry count exceeded')
 
-    def _unpack_fetch_results(self, results: Any, urls: List[str], parser: Union[str, None] = None) -> List[Any]:
-        """Unpack fetch results into BeautifulSoup objects."""
-        from bs4 import BeautifulSoup
-
-        final_results = []
-        for i, result in enumerate(results):
-            url = urls[i]
-            url_parser = parser
-            if url_parser is None:
-                url_parser = 'xml' if url.endswith('.xml') else self.default_parser
-                self._check_parser(url_parser)
-            final_results.append(BeautifulSoup(result, url_parser, **self.bs_kwargs))
-        return final_results
-
     def lazy_load(self) -> Iterator[Document]:
         """Lazy load text from the url(s) in web_path with error handling."""
         for path in self.web_paths:
             try:
-                soup = self._scrape(path, bs_kwargs=self.bs_kwargs)
-                text = soup.get_text(**self.bs_get_text_kwargs)
-
-                # Build metadata
-                metadata = extract_metadata(soup, path)
-
-                yield Document(page_content=text, metadata=metadata)
+                with self.session.get(path, **self.requests_kwargs) as response:
+                    if self.raise_for_status:
+                        response.raise_for_status()
+                    response.encoding = response.apparent_encoding
+                    yield self._document_from_html(response.text, path)
             except Exception as e:
-                # Log the error and continue with the next URL
                 log.exception(f'Error loading {path}: {e}')
 
     def _document_from_html(self, html: str, url: str) -> Document:
         """Build one Document."""
-        soup = self._unpack_fetch_results([html], [url])[0]
+        from bs4 import BeautifulSoup
+
+        parser = 'xml' if url.endswith('.xml') else self.default_parser
+        soup = BeautifulSoup(html, parser, **self.bs_kwargs)
         return Document(
             page_content=soup.get_text(**self.bs_get_text_kwargs),
             metadata=extract_metadata(soup, url),
@@ -991,10 +1171,7 @@ class SafeWebBaseLoader(WebBaseLoader):
 
 def get_web_loader(
     urls: Union[str, Sequence[str]],
-    verify_ssl: bool = True,
-    requests_per_second: int = 2,
-    trust_env: bool = False,
-    loader_config: Optional[dict] = None,
+    config: dict,
 ):
     # Check if the URLs are valid
     safe_urls = safe_validate_urls([urls] if isinstance(urls, str) else urls)
@@ -1003,22 +1180,20 @@ def get_web_loader(
         log.warning(f'All provided URLs were blocked or invalid: {urls}')
         raise ValueError(ERROR_MESSAGES.INVALID_URL)
 
-    loader_config = loader_config or {}
+    def cfg(key):
+        # Preserve the web loaders' fallback for legacy null settings.
+        value = config.get(key)
+        return DEFAULT_CONFIG[key] if value is None else value
 
-    def cfg(key, env_value):
-        # Admin-saved DB value wins; env constant covers keys never saved.
-        value = loader_config.get(key)
-        return env_value if value is None else value
-
-    engine = cfg('web_loader_engine', WEB_LOADER_ENGINE)
-    web_loader_timeout = cfg('web_loader_timeout', WEB_LOADER_TIMEOUT)
+    engine = cfg('web.loader.engine')
+    web_loader_timeout = cfg('web.loader.timeout')
 
     web_loader_args = {
         'web_paths': safe_urls,
-        'verify_ssl': verify_ssl,
-        'requests_per_second': requests_per_second,
+        'verify_ssl': config['web.loader.ssl_verification'],
+        'requests_per_second': config['web.loader.concurrent_requests'],
         'continue_on_failure': True,
-        'trust_env': trust_env,
+        'trust_env': config['web.search.trust_env'],
     }
 
     WebLoaderClass = None
@@ -1041,16 +1216,16 @@ def get_web_loader(
 
     if engine == 'playwright':
         WebLoaderClass = SafePlaywrightURLLoader
-        web_loader_args['playwright_timeout'] = cfg('playwright_timeout', PLAYWRIGHT_TIMEOUT)
-        playwright_ws_url = cfg('playwright_ws_url', PLAYWRIGHT_WS_URL)
+        web_loader_args['playwright_timeout'] = cfg('web.loader.playwright_timeout')
+        playwright_ws_url = cfg('web.loader.playwright_ws_url')
         if playwright_ws_url:
             web_loader_args['playwright_ws_url'] = playwright_ws_url
 
     if engine == 'firecrawl':
         WebLoaderClass = SafeFireCrawlLoader
-        web_loader_args['api_key'] = cfg('firecrawl_api_key', FIRECRAWL_API_KEY)
-        web_loader_args['api_url'] = cfg('firecrawl_api_url', FIRECRAWL_API_BASE_URL)
-        firecrawl_timeout = cfg('firecrawl_timeout', FIRECRAWL_TIMEOUT)
+        web_loader_args['api_key'] = cfg('web.loader.firecrawl_api_key')
+        web_loader_args['api_url'] = cfg('web.loader.firecrawl_api_url')
+        firecrawl_timeout = cfg('web.loader.firecrawl_timeout')
         if firecrawl_timeout:
             try:
                 web_loader_args['timeout'] = int(firecrawl_timeout)
@@ -1059,14 +1234,19 @@ def get_web_loader(
 
     if engine == 'tavily':
         WebLoaderClass = SafeTavilyLoader
-        web_loader_args['api_key'] = cfg('tavily_api_key', TAVILY_API_KEY)
-        web_loader_args['extract_depth'] = cfg('tavily_extract_depth', TAVILY_EXTRACT_DEPTH)
+        web_loader_args['api_key'] = cfg('web.search.tavily_api_key')
+        web_loader_args['extract_depth'] = cfg('web.search.tavily_extract_depth')
+
+    if engine == 'exa':
+        WebLoaderClass = SafeExaLoader
+        web_loader_args['api_key'] = cfg('web.search.exa_api_key')
+        web_loader_args['timeout'] = web_loader_timeout
 
     if engine == 'microsoft_web_iq':
         WebLoaderClass = SafeMicrosoftWebIQLoader
-        web_loader_args['api_base_url'] = cfg('microsoft_web_iq_api_base_url', MICROSOFT_WEB_IQ_API_BASE_URL)
-        web_loader_args['api_key'] = cfg('microsoft_web_iq_api_key', MICROSOFT_WEB_IQ_API_KEY)
-        web_loader_args['language'] = cfg('microsoft_web_iq_language', MICROSOFT_WEB_IQ_LANGUAGE)
+        web_loader_args['api_base_url'] = cfg('web.search.microsoft_web_iq_api_base_url')
+        web_loader_args['api_key'] = cfg('web.search.microsoft_web_iq_api_key')
+        web_loader_args['language'] = cfg('web.search.microsoft_web_iq_language')
         if web_loader_timeout:
             try:
                 web_loader_args['timeout'] = int(web_loader_timeout)
@@ -1075,8 +1255,8 @@ def get_web_loader(
 
     if engine == 'external':
         WebLoaderClass = ExternalWebLoader
-        web_loader_args['external_url'] = cfg('external_web_loader_url', EXTERNAL_WEB_LOADER_URL)
-        web_loader_args['external_api_key'] = cfg('external_web_loader_api_key', EXTERNAL_WEB_LOADER_API_KEY)
+        web_loader_args['external_url'] = cfg('web.loader.external_web_loader_url')
+        web_loader_args['external_api_key'] = cfg('web.loader.external_web_loader_api_key')
 
     if WebLoaderClass:
         web_loader = WebLoaderClass(**web_loader_args)
@@ -1091,5 +1271,5 @@ def get_web_loader(
     else:
         raise ValueError(
             f'Invalid WEB_LOADER_ENGINE: {engine}. '
-            "Please set it to 'safe_web', 'playwright', 'firecrawl', 'tavily', 'external', or 'microsoft_web_iq'."
+            "Please set it to 'safe_web', 'playwright', 'firecrawl', 'tavily', 'exa', 'external', or 'microsoft_web_iq'."
         )

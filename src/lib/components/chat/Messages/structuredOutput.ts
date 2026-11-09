@@ -1,3 +1,5 @@
+import { encode } from 'html-entities';
+
 export type OutputContentPart = {
 	type?: string;
 	text?: unknown;
@@ -9,10 +11,13 @@ export type OutputItem = {
 	id?: string;
 	call_id?: string;
 	name?: string;
+	display_label?: string;
+	display_labels?: { running?: string; completed?: string };
 	status?: string;
+	hidden?: boolean;
 	arguments?: unknown;
 	content?: OutputContentPart[];
-	summary?: OutputContentPart[];
+	summary?: OutputContentPart[] | string;
 	output?: OutputContentPart[];
 	files?: unknown;
 	embeds?: unknown;
@@ -32,6 +37,8 @@ export type OutputDetailToken = {
 		type: string;
 		id?: string;
 		name?: string;
+		display_label?: string;
+		running_label?: string;
 		done?: string;
 		duration?: string;
 		arguments?: string;
@@ -49,6 +56,11 @@ export type OutputDisplayItem =
 			text: string;
 	  }
 	| {
+			type: 'image';
+			id: string;
+			src: string;
+	  }
+	| {
 			type: 'detail_single';
 			id: string;
 			token: OutputDetailToken;
@@ -57,6 +69,16 @@ export type OutputDisplayItem =
 			type: 'detail_group';
 			id: string;
 			tokens: OutputDetailToken[];
+	  }
+	| {
+			type: 'file';
+			id: string;
+			item: Record<string, unknown>;
+	  }
+	| {
+			type: 'context_compaction';
+			id: string;
+			summary: string;
 	  };
 
 type ResponseStreamEvent = {
@@ -142,6 +164,51 @@ function getToolResultText(item?: OutputItem): string {
 		.join('');
 }
 
+function parseJSONStringValue(value: unknown): unknown {
+	if (typeof value !== 'string') {
+		return value;
+	}
+
+	let parsed: unknown = value.trim();
+	while (typeof parsed === 'string') {
+		try {
+			parsed = JSON.parse(parsed);
+		} catch {
+			break;
+		}
+	}
+	return parsed;
+}
+
+function getInlineFileFromToolOutput(callItem?: OutputItem, resultItem?: OutputItem) {
+	if (!callItem || !resultItem || callItem.name !== 'display_file') {
+		return null;
+	}
+
+	const args = parseJSONStringValue(callItem.arguments) as Record<string, unknown>;
+	if (!args || typeof args !== 'object') {
+		return null;
+	}
+
+	const result = parseJSONStringValue(getToolResultText(resultItem)) as Record<string, unknown>;
+	const isTerminalFile = result?.source === 'open_terminal' && !!result.terminal_selector;
+	const isOpenWebUIFile = result?.source === 'open_webui';
+	if (
+		!result ||
+		typeof result !== 'object' ||
+		result.type !== 'file' ||
+		!result.path ||
+		result.exists === false ||
+		!(isTerminalFile || isOpenWebUIFile)
+	) {
+		return null;
+	}
+
+	return result.page === undefined && args.page !== undefined
+		? { ...result, page: args.page }
+		: result;
+}
+
 function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string, OutputItem>) {
 	const callId = item.call_id ?? item.id ?? '';
 	const resultItem = toolOutputByCallId[callId];
@@ -165,24 +232,32 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 	}
 
 	return {
-		summary:
-			isPending
-				? 'Tool Approval Needed'
-				: isDone
-					? 'Tool Executed'
-					: isExecuting
-						? 'Executing...'
-						: 'Preparing...',
+		summary: isPending
+			? 'Tool Approval Needed'
+			: isDone
+				? 'Tool Executed'
+				: isExecuting
+					? 'Executing...'
+					: 'Preparing...',
 		text: getToolResultText(resultItem),
 		attributes: {
 			type: 'tool_calls',
 			id: callId,
 			name,
+			running_label:
+				typeof item.display_labels?.running === 'string' ? item.display_labels.running : '',
+			display_label:
+				typeof item.display_labels?.completed === 'string'
+					? item.display_labels.completed
+					: typeof item.display_label === 'string'
+						? item.display_label
+						: '',
 			done: isDone ? 'true' : 'false',
 			status,
-			arguments: stringifyAttribute(item.arguments ?? ''),
-			files: stringifyAttribute(resultItem?.files),
-			embeds: stringifyAttribute(resultItem?.embeds)
+			// ToolCallDisplay HTML-decodes these, like legacy <details> attributes.
+			arguments: encode(stringifyAttribute(item.arguments ?? '')),
+			files: encode(stringifyAttribute(resultItem?.files)),
+			embeds: encode(stringifyAttribute(resultItem?.embeds))
 		}
 	};
 }
@@ -293,14 +368,25 @@ function buildDetailToken(
 	return null;
 }
 
+export function isHiddenToolCall(item: OutputItem): boolean {
+	return (
+		item.type === 'function_call' &&
+		item.hidden === true &&
+		!['pending', 'queued', 'requires_approval'].includes(item.status ?? '')
+	);
+}
+
 export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDisplayItem[] {
 	const displayItems: OutputDisplayItem[] = [];
 	const currentDetailTokens: OutputDetailToken[] = [];
 	const toolOutputByCallId: Record<string, OutputItem> = {};
+	const toolCallByCallId: Record<string, OutputItem> = {};
 
 	for (const item of output) {
 		if (item?.type === 'function_call_output' && item.call_id) {
 			toolOutputByCallId[item.call_id] = item;
+		} else if (item?.type === 'function_call' && (item.call_id || item.id)) {
+			toolCallByCallId[item.call_id ?? item.id ?? ''] = item;
 		}
 	}
 
@@ -322,19 +408,38 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 	};
 
 	output.forEach((item, index) => {
-		if (item?.type === 'function_call_output') {
+		if (!item) {
+			return;
+		}
+
+		if (isHiddenToolCall(item)) {
+			return;
+		}
+
+		if (item.type === 'function_call_output') {
+			const call = toolCallByCallId[item.call_id ?? ''];
+			if (call && isHiddenToolCall(call)) return;
+			const inlineFile = getInlineFileFromToolOutput(call, item);
+			if (inlineFile) {
+				flushDetails();
+				displayItems.push({
+					type: 'file',
+					id: item.id ?? `file-${index}`,
+					item: inlineFile
+				});
+			}
 			return;
 		}
 
 		if (
-			item?.type === 'function_call' &&
+			item.type === 'function_call' &&
 			item.name === 'ask_user' &&
 			(item.status === 'pending' || item.status === 'in_progress')
 		) {
 			return;
 		}
 
-		if (item?.type && GROUPABLE_OUTPUT_TYPES.has(item.type)) {
+		if (item.type && GROUPABLE_OUTPUT_TYPES.has(item.type)) {
 			const token = buildDetailToken(item, index === output.length - 1, toolOutputByCallId);
 			if (token) {
 				currentDetailTokens.push(token);
@@ -342,7 +447,17 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 			return;
 		}
 
-		if (item?.type === 'message') {
+		if (item.type === 'open_webui:context_compaction') {
+			flushDetails();
+			displayItems.push({
+				type: 'context_compaction',
+				id: item.id ?? `context-compaction-${index}`,
+				summary: typeof item.summary === 'string' ? item.summary : ''
+			});
+			return;
+		}
+
+		if (item.type === 'message') {
 			const text = getMessageText(item);
 			if (text.trim()) {
 				flushDetails();
@@ -350,6 +465,20 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 					type: 'message',
 					id: item.id ?? `message-${index}`,
 					text
+				});
+			}
+			return;
+		}
+
+		if (item.type === 'image_generation_call') {
+			if (typeof item.result === 'string' && item.result) {
+				flushDetails();
+				displayItems.push({
+					type: 'image',
+					id: item.id ?? `image-${index}`,
+					src: item.result.startsWith('data:')
+						? item.result
+						: `data:image/${item.output_format || 'png'};base64,${item.result}`
 				});
 			}
 			return;
@@ -367,6 +496,16 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 	});
 
 	flushDetails();
+
+	// Providers can reuse item ids across tool-call rounds.
+	const seenIds = new Set<string>();
+	displayItems.forEach((displayItem, index) => {
+		if (seenIds.has(displayItem.id)) {
+			displayItem.id = `${displayItem.id}-${index}`;
+		}
+		seenIds.add(displayItem.id);
+	});
+
 	return displayItems;
 }
 
@@ -395,11 +534,18 @@ function appendDelta(current: unknown, delta: unknown): unknown {
 	return delta ?? current ?? '';
 }
 
-function ensureItem(output: OutputItem[], outputIndex: number, fallback?: OutputItem): OutputItem {
+function ensureOutputItem(
+	output: OutputItem[],
+	outputIndex: number,
+	fallback?: OutputItem
+): OutputItem {
 	while (output.length <= outputIndex) {
-		output.push(
-			fallback ?? { type: 'message', status: 'in_progress', role: 'assistant', content: [] }
-		);
+		// Only the addressed slot gets the event's item; filler slots must not reuse its id.
+		const item =
+			output.length === outputIndex && fallback
+				? { ...fallback }
+				: { type: 'message', status: 'in_progress', role: 'assistant', content: [] };
+		output.push(item);
 	}
 	output[outputIndex] = { ...output[outputIndex] };
 	return output[outputIndex];
@@ -413,11 +559,31 @@ function ensurePart(parts: OutputContentPart[], index: number, fallback?: Output
 	return parts[index];
 }
 
+function setPart(
+	parts: OutputContentPart[],
+	index: number,
+	part: OutputContentPart,
+	fallback?: OutputContentPart
+): void {
+	// Assigning past the end leaves a hole that later spreads turn into undefined parts.
+	ensurePart(parts, index, fallback);
+	parts[index] = part;
+}
+
 function findOutputItemIndex(output: OutputItem[], item: OutputItem): number {
 	return output.findIndex(
 		(existing) =>
 			(!!item.id && existing?.id === item.id) ||
-			(!!item.call_id && existing?.call_id === item.call_id)
+			(!!item.call_id && existing?.type === item.type && existing?.call_id === item.call_id)
+	);
+}
+
+function responseEventUpdatesOutputItem(eventType: string): boolean {
+	return (
+		eventType === 'response.content_part.added' ||
+		eventType === 'response.reasoning_summary_part.added' ||
+		eventType.endsWith('.delta') ||
+		eventType.endsWith('.done')
 	);
 }
 
@@ -431,7 +597,19 @@ export function applyResponseStreamEvent(
 	}
 
 	if (eventType === 'response.completed') {
-		return event.response?.output ? [...event.response.output] : output;
+		if (!event.response?.output?.length) return output;
+
+		// Completion covers one provider response, not the earlier tool-call rounds.
+		const nextOutput = [...output];
+		for (const item of event.response.output) {
+			const index = findOutputItemIndex(nextOutput, item);
+			if (index >= 0) {
+				nextOutput[index] = item;
+			} else {
+				nextOutput.push(item);
+			}
+		}
+		return nextOutput;
 	}
 
 	const nextOutput = [...output];
@@ -452,7 +630,7 @@ export function applyResponseStreamEvent(
 		} else if (outputIndex < nextOutput.length) {
 			nextOutput.splice(outputIndex, 0, item);
 		} else {
-			nextOutput[outputIndex] = item;
+			nextOutput.push(item);
 		}
 		return nextOutput;
 	}
@@ -463,11 +641,21 @@ export function applyResponseStreamEvent(
 		}
 		const item = { ...event.item };
 		const existingIndex = findOutputItemIndex(nextOutput, item);
-		nextOutput[existingIndex >= 0 ? existingIndex : outputIndex] = item;
+		if (existingIndex >= 0) {
+			nextOutput[existingIndex] = item;
+		} else if (outputIndex < nextOutput.length) {
+			nextOutput[outputIndex] = item;
+		} else {
+			nextOutput.push(item);
+		}
 		return nextOutput;
 	}
 
-	const item = ensureItem(nextOutput, outputIndex, {
+	if (!responseEventUpdatesOutputItem(eventType)) {
+		return output;
+	}
+
+	const item = ensureOutputItem(nextOutput, outputIndex, {
 		id: event.item_id,
 		type: eventType.includes('reasoning')
 			? 'reasoning'
@@ -484,7 +672,7 @@ export function applyResponseStreamEvent(
 			return nextOutput;
 		}
 		item.content = [...(item.content ?? [])];
-		item.content[event.content_index ?? item.content.length] = { ...event.part };
+		setPart(item.content, event.content_index ?? item.content.length, { ...event.part });
 		return nextOutput;
 	}
 
@@ -492,8 +680,9 @@ export function applyResponseStreamEvent(
 		if (!event.part) {
 			return nextOutput;
 		}
-		item.summary = [...(item.summary ?? [])];
-		item.summary[event.summary_index ?? item.summary.length] = { ...event.part };
+		item.summary = Array.isArray(item.summary) ? [...item.summary] : [];
+		const summaryIndex = event.summary_index ?? item.summary.length;
+		setPart(item.summary, summaryIndex, { ...event.part }, { type: 'summary_text', text: '' });
 		return nextOutput;
 	}
 
@@ -506,9 +695,14 @@ export function applyResponseStreamEvent(
 
 		if (deltaType === 'reasoning_summary_text') {
 			const summaryIndex = event.summary_index ?? 0;
-			item.summary = [...(item.summary ?? [])];
+			item.summary = Array.isArray(item.summary) ? [...item.summary] : [];
 			const part = ensurePart(item.summary, summaryIndex, { type: 'summary_text', text: '' });
 			part.text = appendDelta(part.text ?? '', event.delta);
+			return nextOutput;
+		}
+
+		if (item.type === 'open_webui:code_interpreter') {
+			item.code = `${item.code ?? ''}${event.delta ?? ''}`;
 			return nextOutput;
 		}
 
@@ -523,7 +717,8 @@ export function applyResponseStreamEvent(
 		const typeName = eventType.split('.')[1];
 		if (typeName === 'content_part' && event.part) {
 			item.content = [...(item.content ?? [])];
-			item.content[event.content_index ?? Math.max(item.content.length - 1, 0)] = { ...event.part };
+			const contentIndex = event.content_index ?? Math.max(item.content.length - 1, 0);
+			setPart(item.content, contentIndex, { ...event.part });
 		} else if (typeName === 'function_call_arguments' && event.arguments !== undefined) {
 			item.arguments = event.arguments;
 		} else if (
@@ -555,7 +750,7 @@ export function replaceOutputMessageText(
 		}
 
 		const partIndex = item.content.findIndex(
-			(part) => typeof part.text === 'string' && part.text.includes(oldContent)
+			(part) => typeof part?.text === 'string' && part.text.includes(oldContent)
 		);
 		if (partIndex === -1) {
 			return item;
@@ -566,7 +761,7 @@ export function replaceOutputMessageText(
 		const part = nextContent[partIndex];
 		nextContent[partIndex] = {
 			...part,
-			text: (part.text as string).replace(oldContent, newContent)
+			text: (part.text as string).replace(oldContent, () => newContent)
 		};
 
 		return {
@@ -576,4 +771,63 @@ export function replaceOutputMessageText(
 	});
 
 	return replaced ? nextOutput : output;
+}
+
+export function setOutputText(output: OutputItem[], text: string): OutputItem[] {
+	if (text === getOutputText(output)) {
+		return output;
+	}
+
+	const lastMessage = output.filter((item) => item?.type === 'message').at(-1);
+	if (!lastMessage) {
+		return [
+			...output,
+			{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }
+		];
+	}
+
+	return output.map((item) =>
+		item?.type === 'message'
+			? { ...item, content: item === lastMessage ? [{ type: 'output_text', text }] : [] }
+			: item
+	);
+}
+
+function parseToolArguments(args: unknown): Record<string, unknown> {
+	if (!args) {
+		return {};
+	}
+	let value = args;
+	while (typeof value === 'string') {
+		try {
+			value = JSON.parse(value);
+		} catch {
+			break;
+		}
+	}
+	return typeof value === 'object' && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: {};
+}
+
+export function getPendingAskUserFromMessage<T extends { role?: string; output?: unknown }>(
+	message: T
+) {
+	if (message?.role !== 'assistant' || !Array.isArray(message.output)) {
+		return null;
+	}
+
+	const call = message.output.find(
+		(item: OutputItem) =>
+			item?.type === 'function_call' &&
+			item?.name === 'ask_user' &&
+			item?.status === 'pending' &&
+			(item?.call_id || item?.id)
+	);
+
+	if (call) {
+		return { message, call, args: parseToolArguments(call.arguments) };
+	}
+
+	return null;
 }

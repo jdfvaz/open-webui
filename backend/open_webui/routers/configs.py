@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import copy
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request
 from mcp.shared.auth import OAuthMetadata
 from open_webui.config import BannerModel
-from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, AIOHTTP_CLIENT_TIMEOUT
+from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, AIOHTTP_CLIENT_TIMEOUT, ENABLE_TOOL_SERVERS
 from open_webui.events import EVENTS, publish_event
 from open_webui.models.config import Config
 from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.headers import get_custom_headers
+from open_webui.utils.headers import bearer_auth_header, get_custom_headers
 from open_webui.utils.mcp.client import MCPClient
 from open_webui.utils.oauth import (
     OAuthClientInformationFull,
@@ -23,17 +22,16 @@ from open_webui.utils.oauth import (
     get_discovery_urls,
     get_oauth_client_info_with_dynamic_client_registration,
     get_oauth_client_info_with_static_credentials,
-    recover_static_oauth_client_metadata,
+    recover_oauth_client_metadata,
     resolve_oauth_client_info,
 )
 from open_webui.utils.tools import (
-    bearer_auth_header,
     get_tool_server_data,
     get_tool_server_url,
     set_terminal_servers,
     set_tool_servers,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 router = APIRouter()
 
@@ -41,6 +39,7 @@ log = logging.getLogger(__name__)
 
 CONNECTIONS_CONFIG_KEYS = {
     'ENABLE_DIRECT_CONNECTIONS': 'direct.enable',
+    'ENABLE_DIRECT_INTEGRATIONS': 'direct.integrations.enable',
     'ENABLE_BASE_MODELS_CACHE': 'models.base_models_cache',
 }
 CODE_EXECUTION_CONFIG_KEYS = {
@@ -87,11 +86,9 @@ def config_updates(data: dict, key_map: dict[str, str]) -> dict:
     return {key_map[field]: value for field, value in data.items() if field in key_map}
 
 
-############################
-# ImportConfig
-# Thy configuration come, thy settings be done,
-# in production as it is in development.
-############################
+# Import Config
+# Let what we prepare in quiet hold when the world grows loud,
+# and let those who depend on it find steadiness through change.
 
 
 class ImportConfigForm(BaseModel):
@@ -100,7 +97,9 @@ class ImportConfigForm(BaseModel):
 
 @router.post('/import', response_model=dict)
 async def import_config(request: Request, form_data: ImportConfigForm, user=Depends(get_admin_user)):
-    await Config.upsert(form_data.config)
+    from open_webui.utils.mfa import update_mfa_config
+
+    await update_mfa_config(request, form_data.config)
     await publish_event(
         request,
         EVENTS.CONFIG_IMPORTED,
@@ -111,9 +110,7 @@ async def import_config(request: Request, form_data: ImportConfigForm, user=Depe
     return await Config.get_all()
 
 
-############################
-# ExportConfig
-############################
+# Export Config
 
 
 @router.get('/export', response_model=dict)
@@ -126,13 +123,30 @@ async def get_config_namespace(namespace: str, user=Depends(get_admin_user)):
     return await Config.get_namespace(namespace)
 
 
-############################
+class InterfaceVisibilityForm(BaseModel):
+    visibility: dict[str, StrictBool]
+
+
+@router.post('/interface/visibility', response_model=InterfaceVisibilityForm)
+async def set_interface_visibility(request: Request, form_data: InterfaceVisibilityForm, user=Depends(get_admin_user)):
+    await Config.upsert({'ui.visibility': form_data.visibility})
+    await publish_event(
+        request,
+        EVENTS.CONFIG_UPDATED,
+        actor=user,
+        subject_id='interface',
+        subject_type='config',
+        data={'keys': ['ui.visibility']},
+    )
+    return form_data
+
+
 # Connections Config
-############################
 
 
 class ConnectionsConfigForm(BaseModel):
     ENABLE_DIRECT_CONNECTIONS: bool
+    ENABLE_DIRECT_INTEGRATIONS: bool = False
     ENABLE_BASE_MODELS_CACHE: bool
 
 
@@ -147,7 +161,7 @@ async def set_connections_config(
     form_data: ConnectionsConfigForm,
     user=Depends(get_admin_user),
 ):
-    await Config.upsert(config_updates(form_data.model_dump(), CONNECTIONS_CONFIG_KEYS))
+    await Config.upsert(config_updates(form_data.model_dump(exclude_unset=True), CONNECTIONS_CONFIG_KEYS))
     values = await get_config_values(CONNECTIONS_CONFIG_KEYS)
     await publish_event(
         request,
@@ -176,6 +190,9 @@ async def register_oauth_client(
     type: str | None = None,
     user=Depends(get_admin_user),
 ):
+    if not ENABLE_TOOL_SERVERS:
+        raise HTTPException(status_code=403, detail='Tool servers are disabled')
+
     try:
         oauth_client_id = form_data.client_id
         if type:
@@ -209,9 +226,7 @@ async def register_oauth_client(
         )
 
 
-############################
 # ToolServers Config
-############################
 
 
 class ToolServerConnection(BaseModel):
@@ -219,6 +234,7 @@ class ToolServerConnection(BaseModel):
     path: str
     type: str | None = 'openapi'  # openapi, mcp
     auth_type: str | None
+    forward_cookies: bool = False
     headers: dict | str | None = None
     key: str | None
     config: dict | None
@@ -263,7 +279,7 @@ async def set_tool_servers_config(
 
     await set_tool_servers(request)
 
-    for connection in connections:
+    for connection in connections if ENABLE_TOOL_SERVERS else []:
         server_type = connection.get('type', 'openapi')
         if server_type == 'mcp':
             server_id = (connection.get('info') or {}).get('id')
@@ -272,14 +288,18 @@ async def set_tool_servers_config(
             if auth_type in ('oauth_2.1', 'oauth_2.1_static') and server_id:
                 try:
                     oauth_client_info = resolve_oauth_client_info(connection)
-                    oauth_client_info = await recover_static_oauth_client_metadata(connection, oauth_client_info)
+                    oauth_client_info = await recover_oauth_client_metadata(connection, oauth_client_info)
                     oauth_client_info = apply_connection_oauth_options(connection, oauth_client_info)
                     request.app.state.oauth_client_manager.add_client(
                         f'{server_type}:{server_id}',
                         OAuthClientInformationFull(**oauth_client_info),
                     )
                 except Exception as e:
-                    log.debug('Failed to add OAuth client for MCP tool server: %s', e)
+                    log.debug(
+                        'Failed to add OAuth client for MCP tool server %s: %s',
+                        server_id,
+                        f'{type(e).__name__}: {e}' if str(e) else type(e).__name__,
+                    )
                     continue
 
     await publish_event(
@@ -304,6 +324,7 @@ class TerminalServerConnection(BaseModel):
 
     key: str | None = ''
     auth_type: str | None = 'bearer'
+    forward_cookies: bool = False
 
     config: dict | None = None
 
@@ -356,12 +377,15 @@ async def verify_terminal_server_connection(
     Tries GET {url}/api/v1/policies (orchestrator) then GET {url}/api/config
     (plain terminal).  Returns ``{status: true, type: "orchestrator"|"terminal"}``.
     """
+    if not ENABLE_TOOL_SERVERS:
+        raise HTTPException(status_code=403, detail='Tool servers are disabled')
+
     base_url = (form_data.url or '').rstrip('/')
     if not base_url:
         raise HTTPException(status_code=400, detail='Terminal server URL is required')
 
     headers = {}
-    if form_data.auth_type == 'bearer' and form_data.key:
+    if form_data.auth_type in ('bearer', 'session') and form_data.key:
         headers.update(bearer_auth_header(form_data.key))
 
     try:
@@ -426,12 +450,15 @@ async def put_terminal_server_policy(
     request: Request, form_data: TerminalServerPolicyForm, user=Depends(get_admin_user)
 ):
     """Proxy a policy read or update to an orchestrator terminal server."""
+    if not ENABLE_TOOL_SERVERS:
+        raise HTTPException(status_code=403, detail='Tool servers are disabled')
+
     base_url = (form_data.url or '').rstrip('/')
     if not base_url:
         raise HTTPException(status_code=400, detail='Terminal server URL is required')
 
     headers = {'Content-Type': 'application/json'}
-    if form_data.auth_type == 'bearer' and form_data.key:
+    if form_data.auth_type in ('bearer', 'session') and form_data.key:
         headers.update(bearer_auth_header(form_data.key))
 
     try:
@@ -463,12 +490,15 @@ async def put_terminal_server_lifecycle(
     request: Request, form_data: TerminalServerLifecycleForm, user=Depends(get_admin_user)
 ):
     """Proxy a lifecycle read or update to an orchestrator terminal server."""
+    if not ENABLE_TOOL_SERVERS:
+        raise HTTPException(status_code=403, detail='Tool servers are disabled')
+
     base_url = (form_data.url or '').rstrip('/')
     if not base_url:
         raise HTTPException(status_code=400, detail='Terminal server URL is required')
 
     headers = {'Content-Type': 'application/json'}
-    if form_data.auth_type == 'bearer' and form_data.key:
+    if form_data.auth_type in ('bearer', 'session') and form_data.key:
         headers.update(bearer_auth_header(form_data.key))
 
     try:
@@ -502,12 +532,15 @@ async def refresh_terminal_server_terminals(
     """
     Proxy a terminal refresh request to an orchestrator terminal server.
     """
+    if not ENABLE_TOOL_SERVERS:
+        raise HTTPException(status_code=403, detail='Tool servers are disabled')
+
     base_url = (form_data.url or '').rstrip('/')
     if not base_url:
         raise HTTPException(status_code=400, detail='Terminal server URL is required')
 
     headers = {'Content-Type': 'application/json'}
-    if form_data.auth_type == 'bearer' and form_data.key:
+    if form_data.auth_type in ('bearer', 'session') and form_data.key:
         headers.update(bearer_auth_header(form_data.key))
 
     body = {
@@ -547,6 +580,9 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
     """
     Verify the connection to the tool server.
     """
+    if not ENABLE_TOOL_SERVERS:
+        raise HTTPException(status_code=403, detail='Tool servers are disabled')
+
     try:
         if form_data.type == 'mcp':
             if form_data.auth_type in ('oauth_2.1', 'oauth_2.1_static'):
@@ -674,9 +710,7 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
         )
 
 
-############################
-# CodeInterpreterConfig
-############################
+# Code Interpreter Config
 class CodeInterpreterConfigForm(BaseModel):
     ENABLE_CODE_EXECUTION: bool
     CODE_EXECUTION_ENGINE: str
@@ -722,13 +756,11 @@ async def set_code_execution_config(
     return values
 
 
-############################
-# SetDefaultModels
-############################
+# Set Default Models
 class ModelsConfigForm(BaseModel):
     DEFAULT_MODELS: str | None
     DEFAULT_PINNED_MODELS: str | None
-    MODEL_ORDER_LIST: list[str | None]
+    MODEL_ORDER_LIST: list[str] | None
     DEFAULT_MODEL_METADATA: dict | None = None
     DEFAULT_MODEL_PARAMS: dict | None = None
 
@@ -737,6 +769,7 @@ class ModelsConfigForm(BaseModel):
 async def get_models_defaults(request: Request, user=Depends(get_verified_user)):
     return {
         'DEFAULT_MODEL_METADATA': await Config.get('models.default_metadata'),
+        'DEFAULT_FUNCTION_CALLING': (await Config.get('models.default_params') or {}).get('function_calling'),
     }
 
 
@@ -767,11 +800,27 @@ async def set_models_config(request: Request, form_data: ModelsConfigForm, user=
 class SubagentsConfigForm(BaseModel):
     ENABLE_SUBAGENTS: bool
     SUBAGENTS_BACKGROUND_ENABLED: bool
-    SUBAGENTS_MAX_CONCURRENT: int
-    SUBAGENTS_MAX_ASYNC: int
-    SUBAGENTS_MAX_ITERATIONS: int
-    SUBAGENTS_MAX_OUTPUT: int
+    SUBAGENTS_MAX_CONCURRENT: int | None = Field(default=None, gt=0)
+    SUBAGENTS_MAX_ASYNC: int | None = Field(default=None, gt=0)
+    SUBAGENTS_MAX_ITERATIONS: int | None = Field(default=None, gt=0)
+    SUBAGENTS_MAX_OUTPUT: int | None = Field(default=None, gt=0)
     SUBAGENTS_SYSTEM_PROMPT: str
+
+    @field_validator(
+        'SUBAGENTS_MAX_CONCURRENT',
+        'SUBAGENTS_MAX_ASYNC',
+        'SUBAGENTS_MAX_ITERATIONS',
+        'SUBAGENTS_MAX_OUTPUT',
+        mode='before',
+    )
+    @classmethod
+    def normalize_limit(cls, value):
+        return None if value in ('', 0) else value
+
+    @field_validator('SUBAGENTS_MAX_CONCURRENT', 'SUBAGENTS_MAX_ASYNC', mode='before')
+    @classmethod
+    def normalize_legacy_unlimited(cls, value):
+        return None if value == -1 else value
 
 
 @router.get('/subagents', response_model=SubagentsConfigForm)
@@ -804,18 +853,25 @@ class PromptSuggestion(BaseModel):
 
 
 class SetDefaultSuggestionsForm(BaseModel):
-    suggestions: list[PromptSuggestion]
+    suggestions: list[PromptSuggestion] | None
+    i18n: dict[str, Any] | None = None
 
 
-@router.post('/suggestions', response_model=list[PromptSuggestion])
+@router.post('/suggestions', response_model=dict)
 async def set_default_suggestions(
     request: Request,
     form_data: SetDefaultSuggestionsForm,
     user=Depends(get_admin_user),
 ):
     data = form_data.model_dump()
-    await Config.upsert({'ui.prompt_suggestions': data['suggestions']})
+    await Config.upsert(
+        {
+            'ui.prompt_suggestions': data['suggestions'],
+            'ui.prompt_suggestions_i18n': data.get('i18n') or {},
+        }
+    )
     suggestions = await Config.get('ui.prompt_suggestions')
+    suggestions_i18n = await Config.get('ui.prompt_suggestions_i18n')
     await publish_event(
         request,
         EVENTS.CONFIG_SUGGESTIONS_UPDATED,
@@ -824,12 +880,10 @@ async def set_default_suggestions(
         subject_type='config',
         data={'count': len(suggestions or [])},
     )
-    return suggestions
+    return {'suggestions': suggestions, 'i18n': suggestions_i18n}
 
 
-############################
-# SetBanners
-############################
+# Set Banners
 
 
 class SetBannersForm(BaseModel):

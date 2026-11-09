@@ -18,6 +18,7 @@
 	import XMark from '../icons/XMark.svelte';
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
+	import MCPApp from '$lib/components/chat/Messages/MCPApp.svelte';
 	import { settings } from '$lib/stores';
 
 	export let id: string = '';
@@ -25,6 +26,8 @@
 		type?: string;
 		id?: string;
 		name?: string;
+		display_label?: string;
+		running_label?: string;
 		arguments?: string;
 		result?: string;
 		files?: string;
@@ -35,6 +38,7 @@
 
 	export let open = false;
 	export let grouped = false;
+	export let allowEmbeds = false;
 	export let className = '';
 	export let resolvable = false;
 	export let resolving = false;
@@ -90,6 +94,49 @@
 		}
 	}
 
+	function isToolResultError(value: unknown): boolean {
+		if (typeof value === 'string') {
+			const text = value.trim().toLowerCase();
+			if (
+				text.startsWith('error:') ||
+				text.startsWith('exception:') ||
+				text.startsWith('traceback') ||
+				text.startsWith('http error!')
+			) {
+				return true;
+			}
+		}
+
+		let parsed = value;
+		while (typeof parsed === 'string') {
+			try {
+				parsed = JSON.parse(parsed);
+			} catch {
+				break;
+			}
+		}
+		if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+
+		const result = parsed as Record<string, unknown>;
+		const error = result.error;
+		if (
+			(typeof error === 'string' && error.trim().length > 0) ||
+			(typeof error === 'object' && error !== null)
+		) {
+			return true;
+		}
+
+		const status = typeof result.status === 'string' ? result.status.trim().toLowerCase() : '';
+		if (status === 'error' || status === 'failed') return true;
+
+		const message = result.message;
+		return (
+			(result.success === false || result.ok === false) &&
+			((typeof message === 'string' && message.trim().length > 0) ||
+				(typeof message === 'object' && message !== null))
+		);
+	}
+
 	export let resultContent: string = '';
 
 	$: result = resultContent || decode(attributes?.result ?? '');
@@ -110,6 +157,16 @@
 	$: isExecuting = !isDone && !isRejected && attributes?.status === 'completed';
 	$: isPreparing = !isDone && !isRejected && !needsApproval && !needsInput && !isExecuting;
 	$: isActive = isPreparing || isExecuting;
+	$: isError = attributes?.status === 'failed' || (isDone && isToolResultError(result));
+	$: displayLabel =
+		!needsInput &&
+		!isRejected &&
+		!isError &&
+		!['pending', 'queued', 'requires_approval', 'incomplete'].includes(attributes.status ?? '')
+			? isDone
+				? attributes.display_label
+				: attributes.running_label
+			: '';
 
 	$: parsedArgs = parseArguments(args);
 	$: parsedResult = parseJSONString(result);
@@ -119,6 +176,7 @@
 	};
 
 	const toggleOpenOnKeydown = (event: KeyboardEvent) => {
+		if (event.target !== event.currentTarget) return;
 		if (event.key !== 'Enter' && event.key !== ' ') {
 			return;
 		}
@@ -129,7 +187,7 @@
 </script>
 
 <div {id} class={className}>
-	{#if !grouped && embeds && Array.isArray(embeds) && embeds.length > 0}
+	{#if allowEmbeds && !grouped && embeds && Array.isArray(embeds) && embeds.length > 0}
 		<!-- Embed Mode: Show iframes without collapsible behavior -->
 		<div class="py-1 w-full cursor-pointer">
 			<div class="w-full text-xs text-gray-500">
@@ -137,14 +195,18 @@
 			</div>
 			{#each embeds as embed, idx}
 				<div class="my-2" id={`${componentId}-tool-call-embed-${idx}`}>
-					<FullHeightIframe
-						src={embed}
-						{args}
-						allowScripts={true}
-						allowForms={$settings?.iframeSandboxAllowForms ?? false}
-						allowSameOrigin={$settings?.iframeSandboxAllowSameOrigin ?? false}
-						allowPopups={true}
-					/>
+					{#if typeof embed === 'object' && embed?.type === 'mcp_app'}
+						{#key JSON.stringify(embed)}<MCPApp app={embed} />{/key}
+					{:else if typeof embed === 'string'}
+						<FullHeightIframe
+							src={embed}
+							{args}
+							allowScripts={true}
+							allowForms={$settings?.iframeSandboxAllowForms ?? false}
+							allowSameOrigin={$settings?.iframeSandboxAllowSameOrigin ?? false}
+							allowPopups={true}
+						/>
+					{/if}
 				</div>
 			{/each}
 		</div>
@@ -154,6 +216,7 @@
 			class="{buttonClassName} w-full min-w-0 cursor-pointer"
 			role="button"
 			tabindex="0"
+			aria-expanded={open}
 			on:click={toggleOpen}
 			on:keydown={toggleOpenOnKeydown}
 		>
@@ -171,6 +234,10 @@
 					<div class="text-red-400 dark:text-red-500">
 						<XMark className="size-4" strokeWidth="2.5" />
 					</div>
+				{:else if isError}
+					<div class="text-red-500 dark:text-red-400">
+						<XMark className="size-4" strokeWidth="2.5" />
+					</div>
 				{:else if isDone}
 					<div class="text-emerald-500 dark:text-emerald-400">
 						<CheckCircle className="size-4" strokeWidth="2" />
@@ -184,11 +251,20 @@
 				<!-- Label -->
 				<div class="flex-1 min-w-0 line-clamp-1">
 					<!-- Short label (below md) -->
-					<span class="@md:hidden text-black dark:text-white">{attributes.name}</span>
+					<span
+						class="@md:hidden text-black dark:text-white"
+						title={displayLabel ? attributes.name : undefined}
+						>{displayLabel || attributes.name}</span
+					>
 					<!-- Full label (md and above) -->
-					<span class="hidden @md:inline font-normal">
+					<span
+						class="hidden @md:inline font-normal"
+						title={displayLabel ? attributes.name : undefined}
+					>
 						{#if isRejected}
 							{$i18n.t('Denied {{NAME}}', { NAME: attributes.name })}
+						{:else if displayLabel}
+							{displayLabel}
 						{:else if isDone}
 							{$i18n.t('View Result from {{NAME}}', { NAME: attributes.name })}
 						{:else if needsInput}

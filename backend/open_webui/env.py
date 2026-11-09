@@ -7,7 +7,9 @@ import pkgutil
 import re
 import shutil
 import sys
+import threading
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -16,9 +18,7 @@ import markdown
 from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives import serialization
 
-####################################
 # Load .env file
-####################################
 
 # Use .resolve() to get the canonical path, removing any '..' or '.' components
 ENV_FILE_PATH = Path(__file__).resolve()
@@ -40,12 +40,13 @@ except ImportError:
     print('dotenv not installed, skipping...')
 
 DOCKER = os.getenv('DOCKER', 'False').lower() == 'true'
+USE_SLIM = os.getenv('USE_SLIM_DOCKER', 'False').lower() == 'true'
 
 USE_CUDA = os.getenv('USE_CUDA_DOCKER', 'false')
 DEVICE_TYPE = 'cpu'
 _cuda_error: Optional[str] = None
 
-if USE_CUDA.lower() == 'true':
+if not USE_SLIM and USE_CUDA.lower() == 'true':
     try:
         import torch  # noqa: E402
 
@@ -57,7 +58,7 @@ if USE_CUDA.lower() == 'true':
         os.environ['USE_CUDA_DOCKER'] = 'false'
         USE_CUDA = 'false'
 
-if sys.platform == 'darwin' and DEVICE_TYPE == 'cpu':
+if not USE_SLIM and sys.platform == 'darwin' and DEVICE_TYPE == 'cpu':
     try:
         import torch  # noqa: E402
 
@@ -66,9 +67,10 @@ if sys.platform == 'darwin' and DEVICE_TYPE == 'cpu':
     except Exception:
         pass
 
-####################################
-# LOGGING
-####################################
+# Torch MPS inference is not thread-safe and a concurrent call kills the whole process.
+MPS_INFERENCE_LOCK = threading.Lock() if DEVICE_TYPE == 'mps' else nullcontext()
+
+# Logging
 
 _LEVEL_MAP = {
     'DEBUG': 'debug',
@@ -126,9 +128,7 @@ if _cuda_error:
 
 SRC_LOG_LEVELS = {}  # Legacy variable, do not remove
 
-####################################
 # ENV (dev,test,prod)
-####################################
 
 ENV = os.getenv('ENV', 'dev')
 
@@ -153,7 +153,7 @@ ENABLE_DB_MIGRATIONS = os.getenv('ENABLE_DB_MIGRATIONS', 'True').lower() == 'tru
 # Swap the JSON encoder/decoder used across the app (HTTP request bodies, JSONResponse
 # bodies, upstream provider responses, socket.io payloads) from the stdlib `json` module
 # to orjson. Faster, but stricter: see open_webui/utils/json_codec.py for the differences.
-ENABLE_ORJSON = os.getenv('ENABLE_ORJSON', 'False').lower() == 'true'
+ENABLE_ORJSON = os.getenv('ENABLE_ORJSON', 'True').lower() == 'true'
 
 
 # Function to parse each section
@@ -215,9 +215,7 @@ for version in soup.find_all('h2'):
 
 CHANGELOG = changelog_json
 
-####################################
-# DATA/FRONTEND BUILD DIR
-####################################
+# Data/frontend build dir
 
 DATA_DIR = Path(os.getenv('DATA_DIR', BACKEND_DIR / 'data')).resolve()
 
@@ -245,16 +243,12 @@ if FROM_INIT_PY:
 
 STATIC_DIR = Path(os.getenv('STATIC_DIR', OPEN_WEBUI_DIR / 'static'))
 
-FONTS_DIR = Path(os.getenv('FONTS_DIR', OPEN_WEBUI_DIR / 'static' / 'fonts'))
-
 FRONTEND_BUILD_DIR = Path(os.getenv('FRONTEND_BUILD_DIR', BASE_DIR / 'build')).resolve()
 
 if FROM_INIT_PY:
     FRONTEND_BUILD_DIR = Path(os.getenv('FRONTEND_BUILD_DIR', OPEN_WEBUI_DIR / 'frontend')).resolve()
 
-####################################
 # Database
-####################################
 
 # Check if the file exists
 if os.path.exists(f'{DATA_DIR}/ollama.db'):
@@ -353,12 +347,11 @@ DATABASE_SQLITE_PRAGMA_MMAP_SIZE = os.getenv('DATABASE_SQLITE_PRAGMA_MMAP_SIZE',
 # truncated.  67108864 ≈ 64 MB.  Set to -1 for no limit (SQLite default).
 DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT = os.getenv('DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT', '67108864')
 
-DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = os.getenv('DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL', None)
-if DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL is not None:
-    try:
-        DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = float(DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL)
-    except Exception:
-        DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = 0.0
+# Seconds between presence writes per user per worker; keep under the 180s active-user window. 0 disables.
+try:
+    DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = float(os.getenv('DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL', '60'))
+except ValueError:
+    DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL = 60.0
 
 DATABASE_ENABLE_SESSION_SHARING = os.getenv('DATABASE_ENABLE_SESSION_SHARING', 'False').lower() == 'true'
 ENABLE_PUBLIC_ACTIVE_USERS_COUNT = os.getenv('ENABLE_PUBLIC_ACTIVE_USERS_COUNT', 'True').lower() == 'true'
@@ -368,14 +361,28 @@ ENABLE_QUERIES_CACHE = os.getenv('ENABLE_QUERIES_CACHE', 'False').lower() == 'tr
 ENABLE_ADMIN_CHAT_ACCESS = os.getenv('ENABLE_ADMIN_CHAT_ACCESS', 'True').lower() == 'true'
 RAG_SYSTEM_CONTEXT = os.getenv('RAG_SYSTEM_CONTEXT', 'False').lower() == 'true'
 
-####################################
-# REDIS
-####################################
+# Empty by default: chunk metadata also holds internal bookkeeping (file hashes, collection names, scores).
+RAG_SOURCE_METADATA_KEYS = [key.strip() for key in os.getenv('RAG_SOURCE_METADATA_KEYS', '').split(',') if key.strip()]
+
+# Redis
 
 REDIS_URL = os.getenv('REDIS_URL', '')
 REDIS_CLUSTER = os.getenv('REDIS_CLUSTER', 'False').lower() == 'true'
 
 REDIS_KEY_PREFIX = os.getenv('REDIS_KEY_PREFIX', 'open-webui')
+
+try:
+    REDIS_RESPONSE_STREAM_TTL = int(os.getenv('REDIS_RESPONSE_STREAM_TTL', '3600'))
+except ValueError:
+    REDIS_RESPONSE_STREAM_TTL = 3600
+
+# Seconds a task survives without a heartbeat. 0 disables expiry.
+try:
+    REDIS_TASK_TTL = int(os.getenv('REDIS_TASK_TTL', '300'))
+    if REDIS_TASK_TTL != 0 and REDIS_TASK_TTL < 60:
+        REDIS_TASK_TTL = 300
+except ValueError:
+    REDIS_TASK_TTL = 300
 
 REDIS_SENTINEL_HOSTS = os.getenv('REDIS_SENTINEL_HOSTS', '')
 REDIS_SENTINEL_PORT = os.getenv('REDIS_SENTINEL_PORT', '26379')
@@ -435,18 +442,17 @@ else:
     except Exception:
         REDIS_RECONNECT_DELAY = None
 
-####################################
 # Uvicorn
-####################################
 
 try:
     UVICORN_WORKERS = max(int(os.getenv('UVICORN_WORKERS', '1')), 1)
 except (ValueError, TypeError):
     UVICORN_WORKERS = 1
 
-####################################
-# WEBSOCKET SUPPORT
-####################################
+# tiny delta-stream frames make per-frame websocket compression CPU-bound, allow opting out (true/false)
+UVICORN_WS_PER_MESSAGE_DEFLATE = os.getenv('UVICORN_WS_PER_MESSAGE_DEFLATE', 'True').lower() == 'true'
+
+# Websocket support
 
 ENABLE_WEBSOCKET_SUPPORT = os.getenv('ENABLE_WEBSOCKET_SUPPORT', 'True').lower() == 'true'
 
@@ -470,6 +476,12 @@ else:
 
 WEBSOCKET_REDIS_URL = os.getenv('WEBSOCKET_REDIS_URL', REDIS_URL)
 WEBSOCKET_REDIS_CLUSTER = os.getenv('WEBSOCKET_REDIS_CLUSTER', str(REDIS_CLUSTER)).lower() == 'true'
+
+# publishes room-targeted emits on per-room redis channels so instances skip
+# messages for rooms without local members; must be identical across the fleet
+# (toggle with a full restart, not a rolling one), set false for the previous
+# shared-channel-only delivery
+WEBSOCKET_REDIS_ROOM_CHANNELS = os.getenv('WEBSOCKET_REDIS_ROOM_CHANNELS', 'True').lower() == 'true'
 
 websocket_redis_lock_timeout = os.getenv('WEBSOCKET_REDIS_LOCK_TIMEOUT', '60')
 
@@ -499,6 +511,15 @@ try:
     WEBSOCKET_SERVER_PING_INTERVAL = int(WEBSOCKET_SERVER_PING_INTERVAL)
 except ValueError:
     WEBSOCKET_SERVER_PING_INTERVAL = 25
+
+WEBSOCKET_HEARTBEAT_INTERVAL = os.getenv('WEBSOCKET_HEARTBEAT_INTERVAL', '')
+if WEBSOCKET_HEARTBEAT_INTERVAL == '':
+    WEBSOCKET_HEARTBEAT_INTERVAL = None
+else:
+    try:
+        WEBSOCKET_HEARTBEAT_INTERVAL = min(max(int(WEBSOCKET_HEARTBEAT_INTERVAL), 5), 90)
+    except ValueError:
+        WEBSOCKET_HEARTBEAT_INTERVAL = 30
 
 WEBSOCKET_EVENT_CALLER_TIMEOUT = os.getenv('WEBSOCKET_EVENT_CALLER_TIMEOUT', '')
 
@@ -572,6 +593,8 @@ def _parse_ssl_env(value: str) -> 'bool | _ssl.SSLContext':
 
 REQUESTS_VERIFY = os.getenv('REQUESTS_VERIFY', 'True').lower() == 'true'
 
+TAVILY_API_BASE_URL = os.getenv('TAVILY_API_BASE_URL', 'https://api.tavily.com').rstrip('/')
+
 _aiohttp_timeout_raw = os.getenv('AIOHTTP_CLIENT_TIMEOUT', '')
 try:
     AIOHTTP_CLIENT_TIMEOUT = int(_aiohttp_timeout_raw) if _aiohttp_timeout_raw else None
@@ -635,6 +658,23 @@ try:
 except (ValueError, TypeError):
     AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA = 10
 
+# Terminal requests can provision a container before returning metadata.
+AIOHTTP_CLIENT_TIMEOUT_TERMINAL = os.getenv(
+    'AIOHTTP_CLIENT_TIMEOUT_TERMINAL',
+    os.getenv('AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA', '60'),
+)
+
+if AIOHTTP_CLIENT_TIMEOUT_TERMINAL == '':
+    AIOHTTP_CLIENT_TIMEOUT_TERMINAL = None
+else:
+    try:
+        AIOHTTP_CLIENT_TIMEOUT_TERMINAL = int(AIOHTTP_CLIENT_TIMEOUT_TERMINAL)
+    except (ValueError, TypeError):
+        AIOHTTP_CLIENT_TIMEOUT_TERMINAL = 60
+
+if AIOHTTP_CLIENT_TIMEOUT_TERMINAL is not None and AIOHTTP_CLIENT_TIMEOUT_TERMINAL <= 0:
+    AIOHTTP_CLIENT_TIMEOUT_TERMINAL = None
+
 AIOHTTP_FILE_STREAM_CHUNK_SIZE = os.getenv('AIOHTTP_FILE_STREAM_CHUNK_SIZE', str(1024 * 1024))
 try:
     AIOHTTP_FILE_STREAM_CHUNK_SIZE = int(AIOHTTP_FILE_STREAM_CHUNK_SIZE)
@@ -660,9 +700,11 @@ else:
     except Exception:
         AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER = AIOHTTP_CLIENT_TIMEOUT
 
-# Timeout (in seconds) for the MCP session.initialize() handshake.
-# The handshake performs a list-tools round-trip and can take tens of
-# seconds on cold-start servers or servers exposing many tools.
+# Timeout (in seconds) for each MCP protocol request other than a tool call:
+# the legacy initialize handshake, tool listing and resource reads. Raise it
+# for cold-start servers or servers exposing many tools. The SDK bounds its
+# server/discover probe separately (10s), and tool calls use
+# AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER.
 MCP_INITIALIZE_TIMEOUT = os.getenv('MCP_INITIALIZE_TIMEOUT', '10')
 try:
     MCP_INITIALIZE_TIMEOUT = int(MCP_INITIALIZE_TIMEOUT)
@@ -670,9 +712,7 @@ except (ValueError, TypeError):
     MCP_INITIALIZE_TIMEOUT = 10
 
 
-####################################
 # AIOHTTP Connection Pool
-####################################
 
 AIOHTTP_POOL_CONNECTIONS = os.getenv('AIOHTTP_POOL_CONNECTIONS', '')
 if AIOHTTP_POOL_CONNECTIONS == '':
@@ -700,6 +740,15 @@ try:
 except ValueError:
     AIOHTTP_POOL_DNS_TTL = 300
 
+# Target chunks buffered before insertion, rounded up to a whole embedding batch.
+try:
+    RAG_EMBEDDING_BUFFER_SIZE = int(os.getenv('RAG_EMBEDDING_BUFFER_SIZE', '1000'))
+    if RAG_EMBEDDING_BUFFER_SIZE <= 0:
+        raise ValueError
+except ValueError:
+    log.warning('RAG_EMBEDDING_BUFFER_SIZE must be a positive integer. Defaulting to 1000.')
+    RAG_EMBEDDING_BUFFER_SIZE = 1000
+
 RAG_EMBEDDING_TIMEOUT = os.getenv('RAG_EMBEDDING_TIMEOUT', '')
 
 if RAG_EMBEDDING_TIMEOUT == '':
@@ -711,18 +760,14 @@ else:
         RAG_EMBEDDING_TIMEOUT = None
 
 
-####################################
 # Auth
-####################################
 
 WEBUI_AUTH = os.getenv('WEBUI_AUTH', 'True').lower() == 'true'
 
 ENABLE_INITIAL_ADMIN_SIGNUP = os.getenv('ENABLE_INITIAL_ADMIN_SIGNUP', 'False').lower() == 'true'
 ENABLE_SIGNUP_PASSWORD_CONFIRMATION = os.getenv('ENABLE_SIGNUP_PASSWORD_CONFIRMATION', 'False').lower() == 'true'
 
-####################################
 # Secret key & cookies
-####################################
 
 # WEBUI_JWT_SECRET_KEY is deprecated; use WEBUI_SECRET_KEY instead.
 # No hardcoded fallback by design: the supported start scripts set/auto-generate it; unset is rejected below.
@@ -756,9 +801,7 @@ if WEBUI_AUTH and WEBUI_SECRET_KEY == '':
 
 ENABLE_COMPRESSION_MIDDLEWARE = os.getenv('ENABLE_COMPRESSION_MIDDLEWARE', 'True').lower() == 'true'
 
-####################################
 # Admin Account Runtime Creation
-####################################
 
 # Optional env vars for creating an admin account on startup
 # Useful for headless/automated deployments
@@ -804,14 +847,34 @@ BYPASS_RETRIEVAL_ACCESS_CONTROL = os.getenv('BYPASS_RETRIEVAL_ACCESS_CONTROL', '
 # for non-admin users.  When False (default), unknown collection names are
 # denied — closing the legacy unscoped namespace.
 ENABLE_RETRIEVAL_UNSCOPED_COLLECTIONS = os.getenv('ENABLE_RETRIEVAL_UNSCOPED_COLLECTIONS', 'False').lower() == 'true'
+
+# Falls back to the upload size limit, because a document cannot legitimately carry more metadata
+# than the file itself is allowed to be. Left unbounded, a small archive that expands enormously
+# during extraction can exhaust memory. RAG_FILE_MAX_SIZE is in MB.
+RAG_METADATA_MAX_VALUE_CHARS = (
+    int(os.getenv('RAG_METADATA_MAX_VALUE_CHARS'))
+    if os.getenv('RAG_METADATA_MAX_VALUE_CHARS')
+    else ((int(os.getenv('RAG_FILE_MAX_SIZE', '0')) or 0) * 1024 * 1024 or None)
+)
+
 MINERU_MAX_MARKDOWN_BYTES = (
     int(os.getenv('MINERU_MAX_MARKDOWN_BYTES')) if os.getenv('MINERU_MAX_MARKDOWN_BYTES') else None
 )
 
+rapidocr_params = os.getenv('RAPIDOCR_PARAMS', '{"EngineConfig.onnxruntime.intra_op_num_threads": 1}')
+try:
+    rapidocr_params = json.loads(rapidocr_params)
+except json.JSONDecodeError:
+    rapidocr_params = {}
+if not isinstance(rapidocr_params, dict):
+    rapidocr_params = {}
+
+RAPIDOCR_PARAMS = rapidocr_params
+
 # When enabled, skips pydub-based preprocessing (format conversion, compression,
 # and chunked splitting) before sending files to processing engines. Useful when
 # the upstream provider handles these steps or when ffmpeg is unavailable.
-BYPASS_PYDUB_PREPROCESSING = os.getenv('BYPASS_PYDUB_PREPROCESSING', 'False').lower() == 'true'
+BYPASS_PYDUB_PREPROCESSING = USE_SLIM or os.getenv('BYPASS_PYDUB_PREPROCESSING', 'False').lower() == 'true'
 
 # When disabled (default), the OpenAI catch-all proxy endpoint (/{path:path})
 # is blocked. Enable only if you need direct passthrough to upstream OpenAI-
@@ -820,9 +883,7 @@ ENABLE_OPENAI_API_PASSTHROUGH = os.getenv('ENABLE_OPENAI_API_PASSTHROUGH', 'Fals
 
 WEBUI_AUTH_SIGNOUT_REDIRECT_URL = os.getenv('WEBUI_AUTH_SIGNOUT_REDIRECT_URL', None)
 
-####################################
 # OAUTH Configuration
-####################################
 ENABLE_OAUTH_EMAIL_FALLBACK = os.getenv('ENABLE_OAUTH_EMAIL_FALLBACK', 'False').lower() == 'true'
 
 ENABLE_OAUTH_ID_TOKEN_COOKIE = os.getenv('ENABLE_OAUTH_ID_TOKEN_COOKIE', 'True').lower() == 'true'
@@ -857,9 +918,7 @@ OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIENT_IDS = [
 # Requires Redis for JWT revocation.
 ENABLE_OAUTH_BACKCHANNEL_LOGOUT = os.getenv('ENABLE_OAUTH_BACKCHANNEL_LOGOUT', 'False').lower() == 'true'
 
-####################################
 # SCIM Configuration
-####################################
 
 ENABLE_SCIM = os.getenv('ENABLE_SCIM', os.getenv('SCIM_ENABLED', 'False')).lower() == 'true'
 SCIM_TOKEN = os.getenv('SCIM_TOKEN', '')
@@ -872,9 +931,7 @@ if ENABLE_SCIM and not SCIM_AUTH_PROVIDER:
         'to enable externalId storage.'
     )
 
-####################################
 # LICENSE_KEY
-####################################
 
 LICENSE_KEY = os.getenv('LICENSE_KEY', '')
 
@@ -897,9 +954,7 @@ if LICENSE_PUBLIC_KEY:
     )
 
 
-####################################
 # WEBUI Identity
-####################################
 
 # LICENSE covers this Open WebUI branding surface, including name, logo,
 # visual, textual, symbolic identifiers, metadata, and surrounding UI.
@@ -917,9 +972,7 @@ WEBUI_FAVICON_URL = 'https://openwebui.com/favicon.png'
 WEBUI_BUILD_HASH = os.getenv('WEBUI_BUILD_HASH', 'dev-build')
 TRUSTED_SIGNATURE_KEY = os.getenv('TRUSTED_SIGNATURE_KEY', '')
 
-####################################
 # Feature flags
-####################################
 
 SAFE_MODE = os.getenv('SAFE_MODE', 'False').lower() == 'true'
 ENABLE_EASTER_EGGS = os.getenv('ENABLE_EASTER_EGGS', 'True').lower() == 'true'
@@ -941,9 +994,7 @@ PROFILE_IMAGE_ALLOWED_MIME_TYPES = frozenset(
 _profile_image_max_data_uri_size = os.getenv('PROFILE_IMAGE_MAX_DATA_URI_SIZE', '').strip()
 PROFILE_IMAGE_MAX_DATA_URI_SIZE = int(_profile_image_max_data_uri_size) if _profile_image_max_data_uri_size else None
 
-####################################
 # Forward Headers
-####################################
 
 ENABLE_FORWARD_USER_INFO_HEADERS = os.getenv('ENABLE_FORWARD_USER_INFO_HEADERS', 'False').lower() == 'true'
 
@@ -951,6 +1002,7 @@ FORWARD_USER_INFO_HEADER_USER_NAME = os.getenv('FORWARD_USER_INFO_HEADER_USER_NA
 FORWARD_USER_INFO_HEADER_USER_ID = os.getenv('FORWARD_USER_INFO_HEADER_USER_ID', 'X-OpenWebUI-User-Id')
 FORWARD_USER_INFO_HEADER_USER_EMAIL = os.getenv('FORWARD_USER_INFO_HEADER_USER_EMAIL', 'X-OpenWebUI-User-Email')
 FORWARD_USER_INFO_HEADER_USER_ROLE = os.getenv('FORWARD_USER_INFO_HEADER_USER_ROLE', 'X-OpenWebUI-User-Role')
+FORWARD_USER_INFO_HEADER_AUTH_TYPE = os.getenv('FORWARD_USER_INFO_HEADER_AUTH_TYPE', 'X-OpenWebUI-Auth-Type')
 FORWARD_SESSION_INFO_HEADER_MESSAGE_ID = os.getenv('FORWARD_SESSION_INFO_HEADER_MESSAGE_ID', 'X-OpenWebUI-Message-Id')
 FORWARD_SESSION_INFO_HEADER_CHAT_ID = os.getenv('FORWARD_SESSION_INFO_HEADER_CHAT_ID', 'X-OpenWebUI-Chat-Id')
 
@@ -965,9 +1017,7 @@ try:
 except ValueError:
     FORWARD_USER_INFO_HEADER_JWT_EXPIRES_SECONDS = 300
 
-####################################
 # Progressive Web App
-####################################
 
 # LICENSE covers this install-time Open WebUI branding surface, including
 # names, logos, manifests, metadata, and surrounding UI.
@@ -975,18 +1025,14 @@ except ValueError:
 # https://docs.openwebui.com/license.
 EXTERNAL_PWA_MANIFEST_URL = os.getenv('EXTERNAL_PWA_MANIFEST_URL', None)
 
-####################################
-# GROUP DEFAULTS
-####################################
+# Group defaults
 
 # Controls the default "Who can share to this group" setting for new groups.
 # Env var values: "true" (anyone), "false" (no one), "members" (only group members).
 _default_group_share = os.getenv('DEFAULT_GROUP_SHARE_PERMISSION', 'members').strip().lower()
 DEFAULT_GROUP_SHARE_PERMISSION = 'members' if _default_group_share == 'members' else _default_group_share == 'true'
 
-####################################
-# MODELS
-####################################
+# Models
 
 ENABLE_CUSTOM_MODEL_FALLBACK = os.getenv('ENABLE_CUSTOM_MODEL_FALLBACK', 'False').lower() == 'true'
 
@@ -1000,14 +1046,19 @@ else:
         MODELS_CACHE_TTL = 1
 
 
-####################################
-# CHAT
-####################################
+# Chat
 
 ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION = (
     os.getenv('ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION', 'False').lower() == 'true'
 )
 ENABLE_API_OUTLET_FILTERS = os.getenv('ENABLE_API_OUTLET_FILTERS', 'True').lower() == 'true'
+
+# Opt in to CPython's in-place string append optimization for streamed responses.
+# Off by default for a staged rollout. Only a host already out of memory can lose
+# text here; the default path (a full copy per chunk) raises there too.
+ENABLE_CHAT_RESPONSE_STREAM_INPLACE_APPEND = (
+    os.getenv('ENABLE_CHAT_RESPONSE_STREAM_INPLACE_APPEND', 'False').lower() == 'true'
+)
 
 # When enabled, uses a hardcoded extension-to-MIME dictionary as a last-resort
 # fallback when both mimetypes.guess_type() and file.meta.content_type fail to
@@ -1033,16 +1084,16 @@ else:
 # The old CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES name is accepted as a fallback.
 CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = os.getenv(
     'CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS',
-    os.getenv('CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES', '256'),
+    os.getenv('CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES', '1024'),
 )
 
 if CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS == '':
-    CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = 256
+    CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = 1024
 else:
     try:
         CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = int(CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS)
     except Exception:
-        CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = 256
+        CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS = 1024
 
 # -1 means unlimited (no cap).
 if CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS == -1:
@@ -1067,9 +1118,7 @@ else:
         CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE = None
 
 
-####################################
-# SENTENCE TRANSFORMERS
-####################################
+# Sentence transformers
 
 
 SENTENCE_TRANSFORMERS_BACKEND = os.getenv('SENTENCE_TRANSFORMERS_BACKEND', '')
@@ -1108,9 +1157,7 @@ SENTENCE_TRANSFORMERS_CROSS_ENCODER_SIGMOID_ACTIVATION_FUNCTION = (
     os.getenv('SENTENCE_TRANSFORMERS_CROSS_ENCODER_SIGMOID_ACTIVATION_FUNCTION', 'True').lower() == 'true'
 )
 
-####################################
-# KNOWLEDGE TOOLS
-####################################
+# Knowledge tools
 
 
 def _int_env(name: str, default: int) -> int:
@@ -1130,11 +1177,13 @@ KNOWLEDGE_GREP_MAX_MATCHES = _int_env('KNOWLEDGE_GREP_MAX_MATCHES', 50)
 VIEW_FILE_MAX_CHARS = _int_env('VIEW_FILE_MAX_CHARS', 100_000)
 VIEW_FILE_DEFAULT_MAX_CHARS = _int_env('VIEW_FILE_DEFAULT_MAX_CHARS', 10_000)
 
-####################################
-# TOOLS/FUNCTIONS PIP OPTIONS
-####################################
+# Tools/functions pip options
 
 ENABLE_PLUGINS = os.getenv('ENABLE_PLUGINS', 'True').lower() == 'true'
+# Deployment controls: the master switch always overrides all feature switches.
+ENABLE_TOOLS = ENABLE_PLUGINS and os.getenv('ENABLE_TOOLS', 'True').lower() == 'true'
+ENABLE_FUNCTIONS = ENABLE_PLUGINS and os.getenv('ENABLE_FUNCTIONS', 'True').lower() == 'true'
+ENABLE_TOOL_SERVERS = ENABLE_PLUGINS and os.getenv('ENABLE_TOOL_SERVERS', 'True').lower() == 'true'
 
 ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS = (
     os.getenv('ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS', 'True').lower() == 'true'
@@ -1144,9 +1193,7 @@ PIP_OPTIONS = os.getenv('PIP_OPTIONS', '').split()
 PIP_PACKAGE_INDEX_OPTIONS = os.getenv('PIP_PACKAGE_INDEX_OPTIONS', '').split()
 
 
-####################################
 # OFFLINE_MODE
-####################################
 
 ENABLE_VERSION_UPDATE_CHECK = os.getenv('ENABLE_VERSION_UPDATE_CHECK', 'true').lower() == 'true'
 OFFLINE_MODE = os.getenv('OFFLINE_MODE', 'false').lower() == 'true'
@@ -1155,15 +1202,11 @@ if OFFLINE_MODE:
     os.environ['HF_HUB_OFFLINE'] = '1'
     ENABLE_VERSION_UPDATE_CHECK = False
 
-####################################
 # Pyodide file persistence
-####################################
 
 ENABLE_PYODIDE_FILE_PERSISTENCE = os.getenv('ENABLE_PYODIDE_FILE_PERSISTENCE', 'false').lower() == 'true'
 
-####################################
 # Audit logging
-####################################
 
 
 ENABLE_AUDIT_STDOUT = os.getenv('ENABLE_AUDIT_STDOUT', 'False').lower() == 'true'
@@ -1207,9 +1250,7 @@ AUDIT_INCLUDED_PATHS = [
 ENABLE_AUDIT_GET_REQUESTS = os.getenv('ENABLE_AUDIT_GET_REQUESTS', 'False').lower() == 'true'
 
 
-####################################
-# OPENTELEMETRY
-####################################
+# OpenTelemetry
 
 ENABLE_OTEL = os.getenv('ENABLE_OTEL', 'False').lower() == 'true'
 ENABLE_OTEL_TRACES = os.getenv('ENABLE_OTEL_TRACES', 'False').lower() == 'true'
