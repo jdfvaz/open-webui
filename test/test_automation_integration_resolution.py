@@ -1,4 +1,28 @@
+import pytest
 from open_webui.utils import automation_integrations
+
+
+@pytest.mark.parametrize(
+    ('model_meta', 'expected_features'),
+    [
+        ({}, {'web_search': True, 'image_generation': True}),
+        ({'capabilities': {}}, {'web_search': True, 'image_generation': True}),
+        ({'capabilities': {'web_search': False}}, {'image_generation': True}),
+        ({'capabilities': {'image_generation': False}}, {'web_search': True}),
+    ],
+)
+def test_explicit_features_use_chat_capability_defaults(
+    model_meta: dict[str, object], expected_features: dict[str, bool]
+) -> None:
+    selection = automation_integrations.AutomationIntegrationSelection(
+        feature_ids=['web_search', 'image_generation'],
+    )
+
+    resolved = automation_integrations.resolve_automation_integration_defaults(
+        model_meta, selection, {'web_search': True, 'image_generation': True}
+    )
+
+    assert resolved.features == expected_features
 
 
 def test_mixed_automation_integration_overrides_resolve_independently() -> None:

@@ -64,7 +64,7 @@ def resolve_automation_integration_defaults(
         feature_id: True
         for feature_id in feature_ids
         if feature_id in AUTOMATION_FEATURE_IDS
-        and capabilities.get(feature_id) is True
+        and capabilities.get(feature_id) is not False
         and feature_availability.get(feature_id) is True
     }
     terminal_value = model_meta.get('terminalId')

@@ -152,9 +152,11 @@ export const parseModelIntegrationDefaults = (value: unknown): ModelIntegrationD
 	const capabilities =
 		'capabilities' in value && value.capabilities !== null && typeof value.capabilities === 'object'
 			? {
-					web_search: 'web_search' in value.capabilities && value.capabilities.web_search === true,
+					web_search:
+						!('web_search' in value.capabilities) || value.capabilities.web_search !== false,
 					image_generation:
-						'image_generation' in value.capabilities && value.capabilities.image_generation === true
+						!('image_generation' in value.capabilities) ||
+						value.capabilities.image_generation !== false
 				}
 			: {};
 

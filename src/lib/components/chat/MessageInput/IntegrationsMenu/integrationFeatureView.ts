@@ -16,7 +16,7 @@ export const resolveIntegrationFeatureView = (options: IntegrationFeatureViewOpt
 	const visible = (featureId: IntegrationFeatureId): boolean =>
 		options.useModelDefaults
 			? Boolean(
-					options.capabilities[featureId] &&
+					(options.capabilities[featureId] ?? true) &&
 					options.enabledByConfig[featureId] &&
 					options.permitted[featureId]
 				)
