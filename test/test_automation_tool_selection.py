@@ -1,4 +1,28 @@
+import pytest
 from open_webui.models import automations as automation_models
+
+
+@pytest.mark.parametrize('model_id', ['regular-model', 'agent:review'])
+def test_agent_automation_discards_chat_integrations(model_id: str) -> None:
+    selection = {
+        'tool_ids': ['github'],
+        'skill_ids': ['release-notes'],
+        'filter_ids': ['review-filter'],
+        'feature_ids': ['web_search'],
+    }
+
+    data = automation_models.AutomationData.model_validate(
+        {
+            'prompt': 'Summarize repository activity',
+            'model_id': model_id,
+            'rrule': 'RRULE:FREQ=DAILY',
+            **selection,
+        }
+    ).model_dump()
+
+    assert {key: data[key] for key in selection} == (
+        dict.fromkeys(selection) if model_id.startswith('agent:') else selection
+    )
 
 
 def test_automation_data_preserves_explicit_empty_integration_selection() -> None:

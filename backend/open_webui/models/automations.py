@@ -1,12 +1,12 @@
 import logging
 import time
-from typing import Literal, Optional
+from typing import Literal, Optional, Self
 from uuid import uuid4
 
-from open_webui.models.notifications import emit_changes
 from open_webui.internal.db import Base, get_async_db_context
+from open_webui.models.notifications import emit_changes
 from open_webui.utils.misc import json_text_variants
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlalchemy import JSON, BigInteger, Boolean, Column, Index, String, Text, cast, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,6 +77,15 @@ class AutomationData(BaseModel):
     skill_ids: list[str] | None = None
     filter_ids: list[str] | None = None
     feature_ids: list[Literal['web_search', 'image_generation']] | None = None
+
+    @model_validator(mode='after')
+    def normalize_agent_integrations(self) -> Self:
+        if self.model_id.startswith('agent:'):
+            self.tool_ids = None
+            self.skill_ids = None
+            self.filter_ids = None
+            self.feature_ids = None
+        return self
 
 
 class AutomationModel(BaseModel):
